@@ -10,6 +10,7 @@ performs the layout conversion in a single copy.
 """
 from __future__ import annotations
 
+import atexit
 import os
 import platform
 
@@ -901,6 +902,69 @@ def _select_tier(q, k, v):
     return "v2" if _v2_supported() else "v1"
 
 
+_trace = {}  # (dtype, D, Lq, Lk, causal, label) -> call count
+
+
+def _trace_enabled():
+    return os.environ.get("MTLFLASHATTN_TRACE", "").lower() in ("1", "on", "true", "yes")
+
+
+def _effective_kernel_label(q, k, v):
+    """Resolve the kernel that flash_attn_forward will actually run, for tracing.
+    Mirrors the dispatch in flash_attn_forward / _flash_v2 / _flash_v2_dtype."""
+    D = q.shape[-1]
+    mode = os.environ.get("MTLFLASHATTN_KERNEL", "auto").lower()
+    if mode in ("torch", "pytorch"):
+        return "torch"
+    if mode == "v2_dtype" or mode == "v2_typed":
+        mode = _v2_mode_for_runtime_dtype(q.dtype) or "v0"
+    if mode in ("v2_bf16", "v2_fp32"):
+        return f"v2r({_v2_dtype_spec(mode)[1]})" if _v2_reuse_ok(D) else f"{mode}(TG)"
+    if mode == "v2":
+        return "v2r" if _v2_reuse_ok(D) else "v2"
+    if mode == "v1":
+        return "v1"
+    if mode == "v0":
+        return "v0"
+    # auto
+    tier = _select_tier(q, k, v)
+    if tier == "v2":
+        return "v2r" if _v2_reuse_ok(D) else "v2"
+    if tier in ("v2_fp32", "v2_bf16"):
+        return f"v2r({_v2_dtype_spec(tier)[1]})" if _v2_reuse_ok(D) else f"{tier}(TG)"
+    return tier  # v1, v0, torch
+
+
+def _record_trace(q, k, v, causal):
+    try:
+        label = _effective_kernel_label(q, k, v)
+        key = (str(q.dtype).replace("torch.", ""), int(q.shape[-1]),
+               int(q.shape[2]), int(k.shape[2]), bool(causal), label)
+        _trace[key] = _trace.get(key, 0) + 1
+    except Exception:
+        pass  # tracing must never break a real run
+
+
+def _trace_summary_lines():
+    if not _trace:
+        return []
+    total = sum(_trace.values())
+    lines = [f"[MTLFLASHATTN_TRACE] {total} attention call(s), "
+             f"{len(_trace)} distinct shape/kernel combos:"]
+    for (dt, D, Lq, Lk, causal, label), n in sorted(
+            _trace.items(), key=lambda kv: (-kv[1], kv[0])):
+        lines.append(f"  calls={n:<6} {dt:<9} D={D:<4} Lq={Lq:<6} Lk={Lk:<6} "
+                     f"causal={'T' if causal else 'F'}  -> {label}")
+    return lines
+
+
+@atexit.register
+def _trace_atexit():
+    if _trace_enabled() and _trace:
+        import sys
+        print("\n".join(_trace_summary_lines()), file=sys.stderr, flush=True)
+
+
 def flash_attn_forward(q, k, v, scale, causal):
     """q: [B,Hq,Lq,D], k/v: [B,Hkv,Lk,D] (heads-second, any strides).
 
@@ -916,6 +980,8 @@ def flash_attn_forward(q, k, v, scale, causal):
     for unsupported dtypes/shapes. v2_dtype is an explicit mixed-dtype TensorOps
     mode for real pipelines that emit fp16, fp32, and bf16 attention.
     """
+    if _trace_enabled():
+        _record_trace(q, k, v, causal)
     mode = os.environ.get("MTLFLASHATTN_KERNEL", "auto").lower()
     if mode in ("torch", "pytorch"):
         return _flash_torch(q, k, v, scale, causal)
