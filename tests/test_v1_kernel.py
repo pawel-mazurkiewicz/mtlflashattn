@@ -4,8 +4,8 @@ v1 is fp16-only (half simdgroup matmuls, fp32 softmax state / O accumulation), s
 tolerances are looser than the fp32-accumulating v0: QK^T accumulates in half
 (simdgroup_matrix can't mix half inputs with fp32 accumulation), giving score
 errors ~sqrt(D)*2^-11*scale that exp() turns into ~1-2% output error on a few
-elements. Exact-path users force MTLFLASHATTN_KERNEL=v0; fp32 QK^T accumulation
-on M1-M4 would need MFA-style explicit-layout simdgroup_matrix_storage (v1.5).
+elements. Exact-path users force MTLFLASHATTN_KERNEL=v0; fp32 auto dispatch uses
+the chunked PyTorch fallback rather than the scalar v0 debug path.
 """
 import math
 
@@ -103,6 +103,6 @@ class TestV1Kernel:
         expected = "v2" if _kernel._v2_supported() else "v1"
         assert _kernel._select_tier(q, q, q) == expected
         qf = q.float()
-        assert _kernel._select_tier(qf, qf, qf) == "v0"
+        assert _kernel._select_tier(qf, qf, qf) == "torch"
         q33 = torch.randn(1, 2, 64, 33, device="mps", dtype=torch.float16)
         assert _kernel._select_tier(q33, q33, q33) == "v0"  # D not multiple of 8
