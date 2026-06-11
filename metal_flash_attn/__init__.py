@@ -12,7 +12,13 @@ import torch
 from ._kernel import MAX_HEAD_DIM, flash_attn_forward
 from ._version import __version__
 
-__all__ = ["flash_attn_func", "flash_attn_varlen_func", "__version__"]
+__all__ = [
+    "flash_attn_func",
+    "flash_attn_varlen_func",
+    "flash_attn_qkvpacked_func",
+    "flash_attn_kvpacked_func",
+    "__version__",
+]
 
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
@@ -150,3 +156,23 @@ def flash_attn_varlen_func(
         )  # [1, Hq, Lq_i, D]
         out[cu_q[i]:cu_q[i + 1]] = o[0].permute(1, 0, 2)
     return out
+
+
+def flash_attn_qkvpacked_func(qkv, *args, **kwargs):
+    """Drop-in for flash_attn.flash_attn_qkvpacked_func. qkv: [B, S, 3, H, D]."""
+    if qkv.dim() != 5 or qkv.shape[2] != 3:
+        raise ValueError(
+            f"metal_flash_attn: expected qkv [B,S,3,H,D], got {tuple(qkv.shape)}"
+        )
+    q, k, v = qkv.unbind(dim=2)
+    return flash_attn_func(q, k, v, *args, **kwargs)
+
+
+def flash_attn_kvpacked_func(q, kv, *args, **kwargs):
+    """Drop-in for flash_attn.flash_attn_kvpacked_func. kv: [B, Sk, 2, Hkv, D]."""
+    if kv.dim() != 5 or kv.shape[2] != 2:
+        raise ValueError(
+            f"metal_flash_attn: expected kv [B,S,2,H,D], got {tuple(kv.shape)}"
+        )
+    k, v = kv.unbind(dim=2)
+    return flash_attn_func(q, k, v, *args, **kwargs)

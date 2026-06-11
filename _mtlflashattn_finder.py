@@ -13,7 +13,12 @@ import importlib.util
 import os
 import sys
 
-_SUBMODULE_EXPORTS = ("flash_attn_func", "flash_attn_varlen_func")
+_SUBMODULE_EXPORTS = (
+    "flash_attn_func",
+    "flash_attn_varlen_func",
+    "flash_attn_qkvpacked_func",
+    "flash_attn_kvpacked_func",
+)
 
 
 class _MtlFlashAttnFinder(importlib.abc.MetaPathFinder, importlib.abc.Loader):
