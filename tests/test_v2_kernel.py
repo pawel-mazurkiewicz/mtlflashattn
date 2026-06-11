@@ -78,6 +78,23 @@ class TestV2Kernel:
     def test_tiny_sequence(self):
         run_v2(1, 3, 5, 1, 1, 64)
 
+    def test_preuse_paths_match(self, monkeypatch):
+        """P-reuse path (no TG round-trip) must agree with the TG-round-trip path."""
+        from metal_flash_attn import _kernel
+
+        if not _kernel._v2_reuse_ok(64):
+            pytest.skip("cooperative left-input reuse not supported here")
+        g = torch.Generator(device="cpu").manual_seed(3)
+        q = torch.randn(1, 4, 300, 64, generator=g).to("mps", torch.float16)
+        k = torch.randn(1, 4, 300, 64, generator=g).to("mps", torch.float16)
+        v = torch.randn(1, 4, 300, 64, generator=g).to("mps", torch.float16)
+        monkeypatch.setenv("MTLFLASHATTN_V2_PREUSE", "1")
+        out_r = _kernel.flash_attn_forward(q, k, v, scale=0.125, causal=True)
+        monkeypatch.setenv("MTLFLASHATTN_V2_PREUSE", "0")
+        out_t = _kernel.flash_attn_forward(q, k, v, scale=0.125, causal=True)
+        # v2r accumulates S in half (API constraint) => v1-like tolerance
+        torch.testing.assert_close(out_r.float(), out_t.float(), atol=1.5e-2, rtol=2e-2)
+
     def test_v2_matches_v0(self, monkeypatch):
         from metal_flash_attn._kernel import flash_attn_forward
 

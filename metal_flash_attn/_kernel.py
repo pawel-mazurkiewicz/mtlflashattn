@@ -357,11 +357,214 @@ kernel void flash_attn_fwd_v2(
         Ob[r*DD + c] = half(ctO[i] * tgInvL[row]);
     }
 }
+
+// ---------------------------------------------------------------------------
+// v2r: register-resident P variant — the WWDC recipe with the REAL constraints
+// applied (all discovered empirically, none documented):
+//   * input cooperative tensors require SINGLE-simdgroup ops
+//     ("Input cooperative tensors require a single SIMD group"),
+//   * the source cooperative tensor's element type must equal the left-input
+//     element type => S must accumulate in HALF (v1-like precision tradeoff),
+//   * the PV descriptor needs a STATIC k ("Inner dimension cannot be dynamic").
+// Each simdgroup independently owns SR=16 query rows; reduce_rows works at this
+// scope; P feeds PV via get_left_input_cooperative_tensor — zero threadgroup
+// round-trips for S or P. K/V are padded to BC multiples by the dispatcher
+// (static k means the tail block reads a full BC rows).
+
+constant constexpr int SR = 16;   // query rows per simdgroup (v2r)
+
+kernel void flash_attn_fwd_v2r(
+    device half*  Q  [[buffer(0)]],   // [B,Hq,Lq,DD]
+    device half*  K  [[buffer(1)]],   // [B,Hkv,Lkp,DD] padded to BC multiple
+    device half*  V  [[buffer(2)]],   // [B,Hkv,Lkp,DD] padded to BC multiple
+    device half*  O  [[buffer(3)]],   // [B,Hq,Lq,DD]
+    device int*   SH [[buffer(4)]],   // [B,Hq,Hkv,Lq,Lk,causal,Lkp]
+    device float* PR [[buffer(5)]],   // [scale]
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint  sgid [[simdgroup_index_in_threadgroup]],
+    uint  lane [[thread_index_in_simdgroup]])
+{
+    const int Hq=SH[1], Hkv=SH[2], Lq=SH[3], Lk=SH[4], causal=SH[5], Lkp=SH[6];
+    const float scale = PR[0];
+
+    const int bh  = int(tgid.y);
+    const int b   = bh / Hq;
+    const int hq  = bh % Hq;
+    const int hkv = hq / (Hq / Hkv);
+    const int q0  = int(tgid.x)*(SR*NSG) + int(sgid)*SR;
+
+    threadgroup float tgM[NSG][SR], tgL[NSG][SR], tgCorr[NSG][SR], tgBlk[NSG][SR];
+
+    if (q0 >= Lq) return;             // uniform per simdgroup
+
+    device half* Qp = Q + ulong(bh)*ulong(Lq)*DD;
+    device half* Kp = K + ulong(b*Hkv+hkv)*ulong(Lkp)*DD;
+    device half* Vp = V + ulong(b*Hkv+hkv)*ulong(Lkp)*DD;
+
+    constexpr auto qk_desc = matmul2d_descriptor(
+        SR, BC, static_cast<int>(dynamic_extent), false, true, false,
+        matmul2d_descriptor::mode::multiply);
+    matmul2d<qk_desc, execution_simdgroup> qk_op;
+    constexpr auto pv_desc = matmul2d_descriptor(
+        SR, DD, BC, false, false, false,   // static k: left-input reuse requires it
+        matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<pv_desc, execution_simdgroup> pv_op;
+
+    if (lane < SR) { tgM[sgid][lane] = -INFINITY; tgL[sgid][lane] = 0.0f; }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+
+    auto mQ = tensor(Qp + q0*DD, dextents<int,2>{DD, min(SR, Lq - q0)}, array<int,2>{1, DD});
+    using TT = __tensor_ops_detail::__remove_addrspace_t<decltype(mQ)>;
+
+    auto ctS = qk_op.get_destination_cooperative_tensor<TT, TT, half>();
+    using CtP = decltype(pv_op.get_left_input_cooperative_tensor<half, half, float>());
+    auto ctO = pv_op.get_destination_cooperative_tensor<CtP, TT, float>();
+    #pragma clang loop unroll(full)
+    for (uint16_t i = 0; i < ctO.get_capacity(); ++i) ctO[i] = 0.0f;
+
+    const int shift = Lk - Lq;        // bottom-right causal alignment
+    for (int j0 = 0; j0 < Lk; j0 += BC) {
+        if (causal && j0 > q0 + SR - 1 + shift) break;
+
+        #pragma clang loop unroll(full)
+        for (uint16_t i = 0; i < ctS.get_capacity(); ++i) ctS[i] = half(0.0h);
+        auto mK = tensor(Kp + j0*DD, dextents<int,2>{DD, BC}, array<int,2>{1, DD});
+        qk_op.run(mQ, mK, ctS);
+
+        // scale + bounds/causal mask (half storage, fp32 math)
+        #pragma clang loop unroll(full)
+        for (uint16_t i = 0; i < ctS.get_capacity(); ++i) {
+            if (!ctS.is_valid_element(i)) continue;
+            auto idx = ctS.get_multidimensional_index(i);
+            const int jj = j0 + int(idx[0]);
+            const int ii = q0 + int(idx[1]);
+            const bool ok = (jj < Lk) && (ii < Lq) && (!causal || jj <= ii + shift);
+            ctS[i] = ok ? half(float(ctS[i]) * scale) : half(-INFINITY);
+        }
+
+        // block row-max via reduce_rows (legal at single-simdgroup scope)
+        auto ctMb = qk_op.get_row_reduction_destination_cooperative_tensor<TT, TT, half>();
+        reduce_rows(ctS, ctMb, reduction_operation::max, half(-INFINITY));
+        #pragma clang loop unroll(full)
+        for (uint16_t i = 0; i < ctMb.get_capacity(); ++i) {
+            if (!ctMb.is_valid_element(i)) continue;
+            auto idx = ctMb.get_multidimensional_index(i);
+            tgBlk[sgid][int(idx[0])] = float(ctMb[i]);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane < SR) {
+            const float mo = tgM[sgid][lane];
+            const float mn = max(mo, tgBlk[sgid][lane]);
+            tgCorr[sgid][lane] = (mn == -INFINITY) ? 1.0f : exp(mo - mn);
+            tgM[sgid][lane] = mn;
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        // P = exp(S - m) in place (half)
+        #pragma clang loop unroll(full)
+        for (uint16_t i = 0; i < ctS.get_capacity(); ++i) {
+            if (!ctS.is_valid_element(i)) continue;
+            auto idx = ctS.get_multidimensional_index(i);
+            const float mn = tgM[sgid][int(idx[1])];
+            ctS[i] = (mn == -INFINITY) ? half(0.0h) : half(exp(float(ctS[i]) - mn));
+        }
+
+        // block row-sum via reduce_rows, merge running l
+        auto ctLb = qk_op.get_row_reduction_destination_cooperative_tensor<TT, TT, half>();
+        reduce_rows(ctS, ctLb, reduction_operation::sum, half(0.0h));
+        #pragma clang loop unroll(full)
+        for (uint16_t i = 0; i < ctLb.get_capacity(); ++i) {
+            if (!ctLb.is_valid_element(i)) continue;
+            auto idx = ctLb.get_multidimensional_index(i);
+            tgBlk[sgid][int(idx[0])] = float(ctLb[i]);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane < SR)
+            tgL[sgid][lane] = tgL[sgid][lane]*tgCorr[sgid][lane] + tgBlk[sgid][lane];
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        // rescale running O, accumulate PV with register-resident P
+        #pragma clang loop unroll(full)
+        for (uint16_t i = 0; i < ctO.get_capacity(); ++i) {
+            if (!ctO.is_valid_element(i)) continue;
+            auto idx = ctO.get_multidimensional_index(i);
+            ctO[i] *= tgCorr[sgid][int(idx[1])];
+        }
+        auto ctP = pv_op.get_left_input_cooperative_tensor<half, half, float>(ctS);
+        auto mV = tensor(Vp + j0*DD, dextents<int,2>{DD, BC}, array<int,2>{1, DD});
+        pv_op.run(ctP, mV, ctO);
+    }
+
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    device half* Ob = O + ulong(bh)*ulong(Lq)*DD;
+    #pragma clang loop unroll(full)
+    for (uint16_t i = 0; i < ctO.get_capacity(); ++i) {
+        if (!ctO.is_valid_element(i)) continue;
+        auto idx = ctO.get_multidimensional_index(i);
+        const int row = int(idx[1]);
+        const int r   = q0 + row;
+        const int c   = int(idx[0]);
+        if (r >= Lq || c >= DD) continue;
+        const float l = tgL[sgid][row];
+        Ob[r*DD + c] = half((l > 0.0f) ? (ctO[i] / l) : 0.0f);
+    }
+}
+
+// probe: can the (single-simdgroup, half) QK destination feed PV as left input?
+kernel void v2r_compat(
+    device half* DUMMY [[buffer(0)]],
+    device int*  OUT   [[buffer(1)]])
+{
+    constexpr auto qk_desc = matmul2d_descriptor(
+        SR, BC, static_cast<int>(dynamic_extent), false, true, false,
+        matmul2d_descriptor::mode::multiply);
+    matmul2d<qk_desc, execution_simdgroup> qk_op;
+    constexpr auto pv_desc = matmul2d_descriptor(
+        SR, DD, BC, false, false, false,
+        matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<pv_desc, execution_simdgroup> pv_op;
+
+    auto t = tensor(DUMMY, dextents<int,2>{DD, SR}, array<int,2>{1, DD});
+    using TT = __tensor_ops_detail::__remove_addrspace_t<decltype(t)>;
+    auto ctS = qk_op.get_destination_cooperative_tensor<TT, TT, half>();
+    OUT[0] = pv_op.is_compatible_as_left_input<half, half, float>(ctS) ? 1 : 0;
+}
 """
 
 _lib = None
 _v2_libs = {}
 _v2_support = None
+_v2_reuse = {}
+
+
+def _v2_reuse_ok(D):
+    """True if the register-resident-P (v2r) kernel should be used for this head dim.
+
+    Measured on M5 Max: v2r ~2x v2 at D=64 (25 vs 12 TF/s; causal 23 TF/s = 20x
+    stock) but loses at D=128 (16.6 vs 18.5 TF/s — SR x 128 fp32 O registers per
+    simdgroup collapse occupancy). auto => v2r only for D <= 64.
+    Tradeoff: v2r accumulates S in half (API forces source element type == left
+    input type), so its precision is v1-like rather than v2's fp32.
+    MTLFLASHATTN_V2_PREUSE=1 forces it for all D, =0 disables.
+    """
+    mode = os.environ.get("MTLFLASHATTN_V2_PREUSE", "auto").lower()
+    if mode in ("0", "off", "false"):
+        return False
+    if mode not in ("1", "on", "true") and D > 64:
+        return False
+    ok = _v2_reuse.get(D)
+    if ok is None:
+        try:
+            lib = _get_v2_lib(D)
+            dummy = torch.zeros(32 * D, dtype=torch.float16, device="mps")
+            out = torch.zeros(1, dtype=torch.int32, device="mps")
+            lib.v2r_compat(dummy, out, threads=(32, 1, 1), group_size=(32, 1, 1))
+            torch.mps.synchronize()
+            ok = bool(out.item())
+        except Exception:
+            ok = False
+        _v2_reuse[D] = ok
+    return ok
 
 
 def _get_v2_lib(D):
@@ -460,19 +663,38 @@ def flash_attn_forward(q, k, v, scale, causal):
 
 def _flash_v2(q, k, v, scale, causal):
     """TensorOps matmul2d FA kernel. fp16 in/out, fp32 cooperative accumulation."""
+    import torch.nn.functional as F
+
     B, Hq, Lq, D = q.shape
     Hkv, Lk = k.shape[1], k.shape[2]
     qc = q.contiguous()
     kc = k.contiguous()
     vc = v.contiguous()
     out = torch.empty(B, Hq, Lq, D, device=q.device, dtype=torch.float16)
+    pr = torch.tensor([float(scale)], dtype=torch.float32, device=q.device)
+    lib = _get_v2_lib(D)
+    if _v2_reuse_ok(D):
+        # v2r: static-k PV reads full BC-row tiles — pad K/V to a BC multiple
+        Lkp = -(-Lk // 32) * 32
+        if Lkp != Lk:
+            kc = F.pad(kc, (0, 0, 0, Lkp - Lk))
+            vc = F.pad(vc, (0, 0, 0, Lkp - Lk))
+        sh = torch.tensor(
+            [B, Hq, Hkv, Lq, Lk, 1 if causal else 0, Lkp],
+            dtype=torch.int32, device=q.device,
+        )
+        ntg_x = -(-Lq // 64)  # 4 simdgroups x SR=16 rows per threadgroup
+        lib.flash_attn_fwd_v2r(
+            qc, kc, vc, out, sh, pr,
+            threads=(ntg_x * 128, B * Hq, 1), group_size=(128, 1, 1),
+        )
+        return out
     sh = torch.tensor(
         [B, Hq, Hkv, Lq, Lk, 1 if causal else 0],
         dtype=torch.int32, device=q.device,
     )
-    pr = torch.tensor([float(scale)], dtype=torch.float32, device=q.device)
     ntg_x = -(-Lq // 32)  # BR=32 query rows per threadgroup
-    _get_v2_lib(D).flash_attn_fwd_v2(
+    lib.flash_attn_fwd_v2(
         qc, kc, vc, out, sh, pr,
         threads=(ntg_x * 128, B * Hq, 1), group_size=(128, 1, 1),
     )
