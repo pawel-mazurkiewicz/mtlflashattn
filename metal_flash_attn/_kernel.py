@@ -11,6 +11,7 @@ performs the layout conversion in a single copy.
 from __future__ import annotations
 
 import os
+import platform
 
 import torch
 
@@ -202,7 +203,192 @@ kernel void flash_attn_fwd_v1(
 }
 """
 
+# ---------------------------------------------------------------------------
+# v2: Metal 4 TensorOps (MPP) — macOS 26+/Xcode 27 SDK. Neural Accelerator on
+# M5+, simdgroup path on M1-M4. One threadgroup = BR query rows, 4 simdgroups
+# run matmul2d cooperatively. QK^T lands in a fp32 cooperative tensor; scale +
+# (causal/bounds) masking, the cross-block online-softmax state (m, l, corr)
+# lives in threadgroup arrays updated via cooperative-tensor COORDINATES
+# (get_multidimensional_index) — no reliance on opaque layouts. P round-trips
+# threadgroup memory into the PV matmul (multiply_accumulate into a fp32
+# cooperative O across K blocks); register-resident P reuse is a later,
+# measured optimization. Head dim is baked per-compile (@D@), libs cached.
+_V2_MSL = r"""
+#include <metal_stdlib>
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+using namespace metal;
+using namespace mpp::tensor_ops;
+
+constant constexpr int BR = 32;     // query rows per threadgroup
+constant constexpr int BC = 32;     // keys per block
+constant constexpr int DD = @D@;    // head dim (specialized per compile)
+constant constexpr int NSG = 4;     // simdgroups cooperating per matmul
+
+kernel void flash_attn_fwd_v2(
+    device half*  Q  [[buffer(0)]],   // [B,Hq,Lq,DD]  (non-const: MPP static_assert)
+    device half*  K  [[buffer(1)]],   // [B,Hkv,Lk,DD]
+    device half*  V  [[buffer(2)]],   // [B,Hkv,Lk,DD]
+    device half*  O  [[buffer(3)]],   // [B,Hq,Lq,DD]
+    device int*   SH [[buffer(4)]],   // [B,Hq,Hkv,Lq,Lk,causal]
+    device float* PR [[buffer(5)]],   // [scale]
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint  tid  [[thread_index_in_threadgroup]],
+    uint  sgid [[simdgroup_index_in_threadgroup]],
+    uint  lane [[thread_index_in_simdgroup]])
+{
+    const int Hq=SH[1], Hkv=SH[2], Lq=SH[3], Lk=SH[4], causal=SH[5];
+    const float scale = PR[0];
+
+    const int bh  = int(tgid.y);
+    const int b   = bh / Hq;
+    const int hq  = bh % Hq;
+    const int hkv = hq / (Hq / Hkv);
+    const int q0  = int(tgid.x) * BR;
+
+    // NOTE: tensor::slice() as a matmul2d operand reads WRONG DATA (verified
+    // empirically on macOS 27.0 beta 1, M5 Max — see dev_min_repro3.py).
+    // Operands are constructed as pointer-offset tensors instead; the
+    // remaining-rows extents preserve the op's bounds-checked edge handling.
+    device half* Qp = Q + ulong(bh)*ulong(Lq)*DD;
+    device half* Kp = K + ulong(b*Hkv+hkv)*ulong(Lk)*DD;
+    device half* Vp = V + ulong(b*Hkv+hkv)*ulong(Lk)*DD;
+
+    // QK^T: S[BR,BC] = Q[BR,DD] @ K[BC,DD]^T (NT), written to a THREADGROUP
+    // tensor destination — reduce_rows is single-simdgroup-only, so the online
+    // softmax runs as scalar lane-per-column code on the TG tile instead
+    // (v1's engine). Only ctO stays cooperative (in-register across K blocks).
+    constexpr auto qk_desc = matmul2d_descriptor(
+        BR, BC, static_cast<int>(dynamic_extent), false, true, false,
+        matmul2d_descriptor::mode::multiply);
+    matmul2d<qk_desc, execution_simdgroups<NSG>> qk_op;
+
+    // PV: O[BR,DD] += P[BR,BC] @ V[BC,DD]  (NN, accumulating across K blocks)
+    constexpr auto pv_desc = matmul2d_descriptor(
+        BR, DD, static_cast<int>(dynamic_extent), false, false, false,
+        matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<pv_desc, execution_simdgroups<NSG>> pv_op;
+
+    threadgroup float tgS[BR*BC];
+    threadgroup half  tgP[BR*BC];
+    threadgroup float tgCorr[BR];
+    threadgroup float tgInvL[BR];
+
+    // Operand extents must be the CLAMPED TILE size (min(tile, remaining)) —
+    // oversized extents make the op infer k/n from them and read beyond the tile.
+    auto mQ = tensor(Qp + q0*DD, dextents<int,2>{DD, min(BR, Lq - q0)}, array<int,2>{1, DD});
+    auto tS = tensor(&tgS[0], dextents<int,2>{BC, BR}, array<int,2>{1, BC});
+    auto tP = tensor(&tgP[0], dextents<int,2>{BC, BR}, array<int,2>{1, BC});
+
+    using PvA = __tensor_ops_detail::__remove_addrspace_t<decltype(tP)>;
+    using PvB = __tensor_ops_detail::__remove_addrspace_t<decltype(mQ)>;
+
+    auto ctO = pv_op.get_destination_cooperative_tensor<PvA, PvB, float>();
+    #pragma clang loop unroll(full)
+    for (uint16_t i = 0; i < ctO.get_capacity(); ++i)
+        if (ctO.is_valid_element(i)) ctO[i] = 0.0f;
+
+    // each simdgroup owns 8 of the BR=32 rows for the scalar softmax phase
+    const int r0 = int(sgid) * (BR / NSG);
+    float m[BR / NSG], l[BR / NSG];
+    #pragma clang loop unroll(full)
+    for (int r = 0; r < BR/NSG; ++r) { m[r] = -INFINITY; l[r] = 0.0f; }
+
+    const int shift = Lk - Lq;   // bottom-right causal alignment
+    for (int j0 = 0; j0 < Lk; j0 += BC) {
+        if (causal && j0 > q0 + BR - 1 + shift) break;
+
+        // tensor destinations ACCUMULATE (C = A*B + C) — zero S every block
+        for (int i = int(tid); i < BR*BC; i += NSG*32) tgS[i] = 0.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        auto mK = tensor(Kp + j0*DD, dextents<int,2>{DD, min(BC, Lk - j0)}, array<int,2>{1, DD});
+        qk_op.run(mQ, mK, tS);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // online softmax on the TG tile — lane owns key column j0+lane
+        const int j = j0 + int(lane);
+        #pragma clang loop unroll(full)
+        for (int r = 0; r < BR/NSG; ++r) {
+            const int row  = r0 + r;
+            const int qrow = q0 + row;
+            float s = tgS[row*BC + lane] * scale;
+            const bool ok = (j < Lk) && (qrow < Lq) && (!causal || j <= qrow + shift);
+            s = ok ? s : -INFINITY;
+            const float mb = simd_max(s);
+            const float mn = max(m[r], mb);
+            float p, c;
+            if (mn == -INFINITY) { p = 0.0f; c = 1.0f; }   // row fully masked so far
+            else { p = exp(s - mn); c = exp(m[r] - mn); }
+            l[r] = l[r]*c + simd_sum(p);
+            m[r] = mn;
+            tgCorr[row] = c;
+            tgP[row*BC + lane] = half(p);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // rescale running O by corr (coordinates), accumulate this block's PV
+        #pragma clang loop unroll(full)
+        for (uint16_t i = 0; i < ctO.get_capacity(); ++i) {
+            if (!ctO.is_valid_element(i)) continue;
+            auto idx = ctO.get_multidimensional_index(i);
+            ctO[i] *= tgCorr[int(idx[1])];
+        }
+        auto mV = tensor(Vp + j0*DD, dextents<int,2>{DD, min(BC, Lk - j0)}, array<int,2>{1, DD});
+        pv_op.run(tP, mV, ctO);
+        threadgroup_barrier(mem_flags::mem_threadgroup);  // tgS/tgP reused next block
+    }
+
+    if (lane == 0) {
+        #pragma clang loop unroll(full)
+        for (int r = 0; r < BR/NSG; ++r)
+            tgInvL[r0 + r] = (l[r] > 0.0f) ? (1.0f / l[r]) : 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // normalize and store (manual, bounds-checked, fp32 -> fp16)
+    device half* Ob = O + ulong(bh)*ulong(Lq)*DD;
+    #pragma clang loop unroll(full)
+    for (uint16_t i = 0; i < ctO.get_capacity(); ++i) {
+        if (!ctO.is_valid_element(i)) continue;
+        auto idx = ctO.get_multidimensional_index(i);
+        const int row = int(idx[1]);
+        const int r   = q0 + row;
+        const int c   = int(idx[0]);
+        if (r >= Lq || c >= DD) continue;
+        Ob[r*DD + c] = half(ctO[i] * tgInvL[row]);
+    }
+}
+"""
+
 _lib = None
+_v2_libs = {}
+_v2_support = None
+
+
+def _get_v2_lib(D):
+    lib = _v2_libs.get(D)
+    if lib is None:
+        lib = torch.mps.compile_shader(_V2_MSL.replace("@D@", str(D)))
+        _v2_libs[D] = lib
+    return lib
+
+
+def _v2_supported():
+    """TensorOps v2 needs macOS 26+ (MPP headers) and a working compile."""
+    global _v2_support
+    if _v2_support is None:
+        try:
+            major = int(platform.mac_ver()[0].split(".")[0])
+        except (ValueError, IndexError):
+            major = 0
+        if major < 26 or not torch.backends.mps.is_available():
+            _v2_support = False
+        else:
+            try:
+                _get_v2_lib(64)
+                _v2_support = True
+            except Exception:
+                _v2_support = False
+    return _v2_support
 
 
 def _get_lib():
@@ -230,7 +416,9 @@ def _v1_eligible(q, k, v):
 
 
 def _select_tier(q, k, v):
-    return "v1" if _v1_eligible(q, k, v) else "v0"
+    if not _v1_eligible(q, k, v):
+        return "v0"
+    return "v2" if _v2_supported() else "v1"
 
 
 def flash_attn_forward(q, k, v, scale, causal):
@@ -242,6 +430,18 @@ def flash_attn_forward(q, k, v, scale, causal):
     with D % 8 == 0, else the memory-safe scalar v0).
     """
     mode = os.environ.get("MTLFLASHATTN_KERNEL", "auto").lower()
+    if mode == "v2":
+        if not _v1_eligible(q, k, v):  # same shape/dtype constraints as v1
+            raise RuntimeError(
+                f"metal_flash_attn: v2 kernel forced but ineligible "
+                f"(dtype={q.dtype}, D={q.shape[-1]}; needs fp16, D%8==0, D<={MAX_HEAD_DIM})"
+            )
+        if not _v2_supported():
+            raise RuntimeError(
+                "metal_flash_attn: v2 kernel forced but TensorOps unavailable "
+                "(needs macOS 26+ with MetalPerformancePrimitives)"
+            )
+        return _flash_v2(q, k, v, scale, causal)
     if mode == "v1":
         if not _v1_eligible(q, k, v):
             raise RuntimeError(
@@ -249,9 +449,34 @@ def flash_attn_forward(q, k, v, scale, causal):
                 f"(dtype={q.dtype}, D={q.shape[-1]}; needs fp16, D%8==0, D<={MAX_HEAD_DIM})"
             )
         return _flash_v1(q, k, v, scale, causal)
-    if mode == "auto" and _select_tier(q, k, v) == "v1":
-        return _flash_v1(q, k, v, scale, causal)
+    if mode == "auto":
+        tier = _select_tier(q, k, v)
+        if tier == "v2":
+            return _flash_v2(q, k, v, scale, causal)
+        if tier == "v1":
+            return _flash_v1(q, k, v, scale, causal)
     return _flash_v0(q, k, v, scale, causal)
+
+
+def _flash_v2(q, k, v, scale, causal):
+    """TensorOps matmul2d FA kernel. fp16 in/out, fp32 cooperative accumulation."""
+    B, Hq, Lq, D = q.shape
+    Hkv, Lk = k.shape[1], k.shape[2]
+    qc = q.contiguous()
+    kc = k.contiguous()
+    vc = v.contiguous()
+    out = torch.empty(B, Hq, Lq, D, device=q.device, dtype=torch.float16)
+    sh = torch.tensor(
+        [B, Hq, Hkv, Lq, Lk, 1 if causal else 0],
+        dtype=torch.int32, device=q.device,
+    )
+    pr = torch.tensor([float(scale)], dtype=torch.float32, device=q.device)
+    ntg_x = -(-Lq // 32)  # BR=32 query rows per threadgroup
+    _get_v2_lib(D).flash_attn_fwd_v2(
+        qc, kc, vc, out, sh, pr,
+        threads=(ntg_x * 128, B * Hq, 1), group_size=(128, 1, 1),
+    )
+    return out
 
 
 def _flash_v1(q, k, v, scale, causal):

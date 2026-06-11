@@ -95,12 +95,13 @@ class TestV1Kernel:
         with pytest.raises(RuntimeError):
             flash_attn_forward(q, q, q, scale=0.125, causal=False)
 
-    def test_auto_uses_v1_for_fp16(self, monkeypatch):
+    def test_auto_tier_selection(self, monkeypatch):
         monkeypatch.setenv("MTLFLASHATTN_KERNEL", "auto")
         from metal_flash_attn import _kernel
 
         q = torch.randn(1, 2, 64, 64, device="mps", dtype=torch.float16)
-        assert _kernel._select_tier(q, q, q) == "v1"
+        expected = "v2" if _kernel._v2_supported() else "v1"
+        assert _kernel._select_tier(q, q, q) == expected
         qf = q.float()
         assert _kernel._select_tier(qf, qf, qf) == "v0"
         q33 = torch.randn(1, 2, 64, 33, device="mps", dtype=torch.float16)
