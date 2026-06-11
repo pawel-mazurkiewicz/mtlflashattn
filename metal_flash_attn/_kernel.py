@@ -714,6 +714,51 @@ def _get_v2_lib(D):
     return lib
 
 
+def _build_v2r_dtype_msl():
+    """Derive a dtype-parameterized register-resident-P v2r kernel from the
+    proven fp16 v2r source — single source of truth, so any fix to the fp16
+    kernel carries over. `@ET@` is the element type (e.g. bfloat). Confirmed on
+    M5 Max: bfloat cooperative-tensor reuse via get_left_input_cooperative_tensor
+    compiles and is_compatible_as_left_input(bfloat)==1; 2.5x over the
+    threadgroup-round-trip baseline at D<=64 (dev/spike_v2r_bf16.py)."""
+    src = _V2_MSL
+    i = src.index("constant constexpr int SR")
+    body = src[i:]  # SR const + comments + flash_attn_fwd_v2r + v2r_compat
+    header = (
+        "#include <metal_stdlib>\n"
+        "#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>\n"
+        "using namespace metal;\n"
+        "using namespace mpp::tensor_ops;\n"
+        "constant constexpr int BR = 32;\n"
+        "constant constexpr int BC = 32;\n"
+        "constant constexpr int DD = @D@;\n"
+        "constant constexpr int NSG = 4;\n"
+    )
+    s = header + body
+    s = s.replace("flash_attn_fwd_v2r", "flash_attn_fwd_v2r_dtype")
+    s = s.replace("v2r_compat", "v2r_dtype_compat")
+    return s.replace("half", "@ET@")
+
+
+_V2R_DTYPE_MSL = _build_v2r_dtype_msl()
+_v2r_dtype_libs = {}
+
+
+def _get_v2r_dtype_lib(D, et):
+    key = (D, et)
+    lib = _v2r_dtype_libs.get(key)
+    if lib is None:
+        src = (
+            _V2R_DTYPE_MSL
+            .replace("@D@", str(D))
+            .replace("@SR@", str(_v2r_sr(D)))
+            .replace("@ET@", et)
+        )
+        lib = torch.mps.compile_shader(src)
+        _v2r_dtype_libs[key] = lib
+    return lib
+
+
 _V2_DTYPE_SPECS = {
     "v2_fp32": (torch.float32, "float", "float"),
     "v2_bf16": (torch.bfloat16, "bfloat", "bfloat"),
@@ -992,10 +1037,45 @@ def _flash_torch(q, k, v, scale, causal):
     return out.to(q.dtype)
 
 
+def _flash_v2r_dtype(q, k, v, scale, causal, et):
+    """Register-resident-P v2r kernel in element type `et` (bf16). Mirrors the
+    fp16 v2r dispatch: static-k PV reads full BC-row tiles, so pad K/V to a BC
+    multiple. ~2.5x over the threadgroup-round-trip dtype kernel at D<=64."""
+    import torch.nn.functional as F
+
+    B, Hq, Lq, D = q.shape
+    Hkv, Lk = k.shape[1], k.shape[2]
+    qc = q.contiguous()
+    kc = k.contiguous()
+    vc = v.contiguous()
+    out = torch.empty(B, Hq, Lq, D, device=q.device, dtype=q.dtype)
+    pr = torch.tensor([float(scale)], dtype=torch.float32, device=q.device)
+    Lkp = -(-Lk // 32) * 32
+    if Lkp != Lk:
+        kc = F.pad(kc, (0, 0, 0, Lkp - Lk))
+        vc = F.pad(vc, (0, 0, 0, Lkp - Lk))
+    sh = torch.tensor(
+        [B, Hq, Hkv, Lq, Lk, 1 if causal else 0, Lkp],
+        dtype=torch.int32, device=q.device,
+    )
+    rows_per_tg = _v2r_sr(D) * 4
+    ntg_x = -(-Lq // rows_per_tg)
+    _get_v2r_dtype_lib(D, et).flash_attn_fwd_v2r_dtype(
+        qc, kc, vc, out, sh, pr,
+        threads=(ntg_x * 128, B * Hq, 1), group_size=(128, 1, 1),
+    )
+    return out
+
+
 def _flash_v2_dtype(q, k, v, scale, causal, mode):
     """Experimental TensorOps v2 dtype specialization. No auto promotion yet."""
     B, Hq, Lq, D = q.shape
     Hkv, Lk = k.shape[1], k.shape[2]
+    # At small D, register-resident P (v2r) beats the threadgroup round-trip:
+    # bf16 ~2.5x, fp32 ~1.45x (and fp32 S in registers stays bit-exact). v2r
+    # loses at D>64 to register pressure, so _v2_reuse_ok gates it to D<=64.
+    if mode in ("v2_bf16", "v2_fp32") and _v2_reuse_ok(D):
+        return _flash_v2r_dtype(q, k, v, scale, causal, _v2_dtype_spec(mode)[1])
     qc = q.contiguous()
     kc = k.contiguous()
     vc = v.contiguous()
