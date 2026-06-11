@@ -148,34 +148,50 @@ def test_forced_v0_keeps_debug_path(monkeypatch):
     assert out is sentinel
 
 
-def test_auto_bfloat16_stays_on_v0_until_tensorops_promotion(monkeypatch):
+def test_auto_tier_promotes_eligible_bf16_to_v2_bf16():
     from metal_flash_attn import _kernel
 
+    require_v2()
+    # bf16 is the native fast TensorOps dtype; promote whenever D is eligible,
+    # no length gate (v2_bf16 beats the chunked fallback even at short seqs).
+    for L in (64, 512, 4096):
+        q = torch.randn(1, 2, L, 64, dtype=torch.bfloat16)
+        assert _kernel._select_tier(q, q, q) == "v2_bf16"
+
+
+def test_auto_bf16_ineligible_head_dim_falls_to_torch_not_v0():
+    from metal_flash_attn import _kernel
+
+    require_v2()
+    # D=33 (not %8) is TensorOps-ineligible: route to the fp32 chunked fallback
+    # (fast + accurate) rather than the scalar v0 debug kernel.
+    q = torch.randn(1, 2, 256, 33, dtype=torch.bfloat16)
+    assert _kernel._select_tier(q, q, q) == "torch"
+
+
+def test_auto_bf16_dispatches_v2_bf16_and_matches_reference(monkeypatch):
+    from metal_flash_attn import _kernel
+
+    require_v2()
     monkeypatch.setenv("MTLFLASHATTN_KERNEL", "auto")
 
-    q = torch.randn(1, 2, 5, 64, dtype=torch.bfloat16)
-    sentinel = torch.full_like(q, 3.0)
-    calls = []
-
-    def fake_v0(*args, **kwargs):
-        calls.append(args)
-        return sentinel
+    def fail_v0(*args, **kwargs):
+        raise AssertionError("auto eligible bf16 must use v2_bf16, not scalar v0")
 
     def fail_torch(*args, **kwargs):
-        raise AssertionError("auto bf16 must not use the fp32 torch fallback")
+        raise AssertionError("auto eligible bf16 must use v2_bf16, not chunked torch")
 
-    def fail_v1(*args, **kwargs):
-        raise AssertionError("auto bf16 must not use fp16 v1")
-
-    def fail_v2(*args, **kwargs):
-        raise AssertionError("auto bf16 must not use fp16 v2")
-
-    monkeypatch.setattr(_kernel, "_flash_v0", fake_v0)
+    monkeypatch.setattr(_kernel, "_flash_v0", fail_v0)
     monkeypatch.setattr(_kernel, "_flash_torch", fail_torch)
-    monkeypatch.setattr(_kernel, "_flash_v1", fail_v1)
-    monkeypatch.setattr(_kernel, "_flash_v2", fail_v2)
 
-    out = _kernel.flash_attn_forward(q, q, q, scale=0.125, causal=False)
+    g = torch.Generator(device="cpu").manual_seed(23)
+    q = torch.randn(1, 4, 96, 64, generator=g).to("mps", torch.bfloat16)
+    k = torch.randn(1, 2, 160, 64, generator=g).to("mps", torch.bfloat16)
+    v = torch.randn(1, 2, 160, 64, generator=g).to("mps", torch.bfloat16)
+    scale = 1.0 / math.sqrt(q.shape[-1])
 
-    assert calls
-    assert out is sentinel
+    out = _kernel.flash_attn_forward(q, k, v, scale=scale, causal=True)
+    ref = ref_attention(q, k, v, scale=scale, causal=True)
+
+    assert out.dtype == torch.bfloat16
+    torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)

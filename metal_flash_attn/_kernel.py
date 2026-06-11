@@ -834,11 +834,23 @@ def _v2_fp32_auto_eligible(q, k, v):
     return _v2_supported()
 
 
+def _v2_bf16_auto_eligible(q, k, v):
+    """bf16 auto promotion: bf16 is the native fast TensorOps dtype, and v2_bf16
+    beats the chunked PyTorch fallback at every measured length — so promote
+    whenever D is eligible and TensorOps is available, with no length gate.
+    The alternative under auto was scalar v0 (10x slower)."""
+    return _v2_dtype_eligible(q, k, v, torch.bfloat16) and _v2_supported()
+
+
 def _select_tier(q, k, v):
     if _torch_fallback_eligible(q, k, v):
         if _v2_fp32_auto_eligible(q, k, v):
             return "v2_fp32"
         return "torch"
+    if q.dtype == torch.bfloat16 and k.dtype == torch.bfloat16 and v.dtype == torch.bfloat16:
+        if _v2_bf16_auto_eligible(q, k, v):
+            return "v2_bf16"
+        return "torch"  # fp32 chunked fallback beats scalar v0 for bf16 too
     if not _v1_eligible(q, k, v):
         return "v0"
     return "v2" if _v2_supported() else "v1"
@@ -853,10 +865,11 @@ def flash_attn_forward(q, k, v, scale, causal):
     Auto picks the fastest fp16 Metal tier, and for fp32 routes to the TensorOps
     v2_fp32 kernel on long sequences (>= MTLFLASHATTN_V2_FP32_MIN_SEQ, default
     2048) where it beats the chunked PyTorch fallback, falling back to the
-    PyTorch path on short sequences. v0 stays the explicit scalar debug baseline
-    for unsupported dtypes/shapes. bf16 TensorOps remains explicit while it is
-    benchmarked. v2_dtype is an explicit mixed-dtype TensorOps mode for real
-    pipelines that emit fp16, fp32, and bf16 attention.
+    PyTorch path on short sequences. bf16 routes to the TensorOps v2_bf16 kernel
+    whenever D is eligible (no length gate — it beats the fallback everywhere),
+    else the chunked PyTorch path. v0 stays the explicit scalar debug baseline
+    for unsupported dtypes/shapes. v2_dtype is an explicit mixed-dtype TensorOps
+    mode for real pipelines that emit fp16, fp32, and bf16 attention.
     """
     mode = os.environ.get("MTLFLASHATTN_KERNEL", "auto").lower()
     if mode in ("torch", "pytorch"):
@@ -928,6 +941,8 @@ def flash_attn_forward(q, k, v, scale, causal):
             return _flash_v2(q, k, v, scale, causal)
         if tier == "v2_fp32":
             return _flash_v2_dtype(q, k, v, scale, causal, "v2_fp32")
+        if tier == "v2_bf16":
+            return _flash_v2_dtype(q, k, v, scale, causal, "v2_bf16")
         if tier == "v1":
             return _flash_v1(q, k, v, scale, causal)
         if tier == "torch":
