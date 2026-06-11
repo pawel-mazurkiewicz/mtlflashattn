@@ -80,6 +80,25 @@ class TestShim:
         assert r.returncode != 0
         assert "ModuleNotFoundError" in r.stderr
 
+    def test_packages_distributions_consistency(self):
+        """transformers' is_flash_attn_2_available() does an UNGUARDED
+        PACKAGE_DISTRIBUTION_MAPPING["flash_attn"] lookup (KeyError crash if the
+        module is importable but no distribution provides it). The shim must
+        seed the mapping so libraries see a consistent story — and correctly
+        conclude this is NOT the CUDA flash-attn distribution."""
+        r = run_py("""
+            import importlib.metadata
+            m = importlib.metadata.packages_distributions()
+            assert "flash_attn" in m, "mapping not seeded"
+            # transformers' exact FA2 check must cleanly evaluate to False:
+            assert "flash-attn" not in [p.replace("_", "-") for p in m["flash_attn"]]
+            # and the module itself still imports through the shim
+            import flash_attn
+            print(flash_attn.__version__)
+        """)
+        assert r.returncode == 0, r.stderr
+        assert r.stdout.strip() == "2.7.4"
+
     def test_shimmed_attention_runs(self):
         """End-to-end: a caller that only knows flash_attn gets working attention."""
         r = run_py("""

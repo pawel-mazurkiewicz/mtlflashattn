@@ -54,11 +54,42 @@ class _MtlFlashAttnFinder(importlib.abc.MetaPathFinder, importlib.abc.Loader):
             module.__version__ = FLASH_ATTN_SHIM_VERSION
 
 
+def _patch_packages_distributions():
+    """Keep the metadata story consistent with the import story.
+
+    The finder makes `import flash_attn` work without any pip distribution
+    providing a top-level `flash_attn` package. transformers'
+    is_flash_attn_2_available() does an UNGUARDED
+    `packages_distributions()["flash_attn"]` lookup, which then raises
+    KeyError at transformers import time. Seed the mapping with the truth —
+    flash_attn is provided by mtlflashattn — so such probes evaluate cleanly
+    (and correctly conclude this is NOT the CUDA `flash-attn` distribution,
+    falling back to their non-FA paths). setdefault keeps a real flash-attn
+    install authoritative.
+    """
+    import importlib.metadata
+
+    orig = importlib.metadata.packages_distributions
+    if getattr(orig, "_mtlflashattn_patched", False):
+        return
+
+    def packages_distributions():
+        mapping = orig()
+        mapping.setdefault("flash_attn", ["mtlflashattn"])
+        return mapping
+
+    packages_distributions._mtlflashattn_patched = True
+    importlib.metadata.packages_distributions = packages_distributions
+
+
 def install():
     """Idempotently append the finder to sys.meta_path. Returns True if added."""
+    if os.environ.get("MTLFLASHATTN_SHIM", "auto").lower() in ("off", "0", "false"):
+        return False
     if any(isinstance(f, _MtlFlashAttnFinder) for f in sys.meta_path):
         return False
     sys.meta_path.append(_MtlFlashAttnFinder())
+    _patch_packages_distributions()
     return True
 
 
