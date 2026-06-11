@@ -684,6 +684,12 @@ def _v2_reuse_ok(D):
         return False
     if mode not in ("1", "on", "true") and D > 64:
         return False
+    return _v2r_compat_probe(D)
+
+
+def _v2r_compat_probe(D):
+    """Cached on-device check that the single-simdgroup QK destination can feed
+    PV as a left input at this head dim (the v2r register-resident-P recipe)."""
     ok = _v2_reuse.get(D)
     if ok is None:
         try:
@@ -699,10 +705,28 @@ def _v2_reuse_ok(D):
     return ok
 
 
+def _v2r_dtype_ok(D, mode):
+    """Register-resident-P gate for the dtype kernels, by dtype and head dim.
+    Measured M5 Max (v2r SR=16 vs the threadgroup-round-trip dtype kernel):
+      bf16: 2.5x at D<=64, 1.23x at D=128 -> all eligible D.
+      fp32: 1.45x at D<=64, ~1.0x/loss at D=128 (fp32 S/O register pressure)
+            -> D<=64 only.
+    MTLFLASHATTN_V2_PREUSE=1 forces all D, =0 disables."""
+    if D % 8 != 0 or D > MAX_HEAD_DIM:
+        return False
+    env = os.environ.get("MTLFLASHATTN_V2_PREUSE", "auto").lower()
+    if env in ("0", "off", "false"):
+        return False
+    ceiling = MAX_HEAD_DIM if mode == "v2_bf16" else 64
+    if env not in ("1", "on", "true") and D > ceiling:
+        return False
+    return _v2r_compat_probe(D)
+
+
 def _v2r_sr(D):
-    # Measured (M5 Max, D=128 L=8k): SR=16 -> 16.6 TF/s, SR=8 -> 7.1 TF/s (m=8
-    # tiles waste the native 16-row matmul granularity; register relief doesn't
-    # pay for it). SR=16 everywhere; v2r is only auto-picked for D<=64 anyway.
+    # SR=16 everywhere. Measured (M5 Max): SR=8 and SR=32 both collapse (D=128
+    # bf16: SR=8 -> 7.6, SR=16 -> 23.8, SR=32 -> 5.9 TF/s) -- SR=16 matches the
+    # native 16-row matmul granularity; fewer rows waste it, more rows spill.
     return 16
 
 
@@ -919,7 +943,7 @@ def _effective_kernel_label(q, k, v):
     if mode == "v2_dtype" or mode == "v2_typed":
         mode = _v2_mode_for_runtime_dtype(q.dtype) or "v0"
     if mode in ("v2_bf16", "v2_fp32"):
-        return f"v2r({_v2_dtype_spec(mode)[1]})" if _v2_reuse_ok(D) else f"{mode}(TG)"
+        return f"v2r({_v2_dtype_spec(mode)[1]})" if _v2r_dtype_ok(D, mode) else f"{mode}(TG)"
     if mode == "v2":
         return "v2r" if _v2_reuse_ok(D) else "v2"
     if mode == "v1":
@@ -931,7 +955,7 @@ def _effective_kernel_label(q, k, v):
     if tier == "v2":
         return "v2r" if _v2_reuse_ok(D) else "v2"
     if tier in ("v2_fp32", "v2_bf16"):
-        return f"v2r({_v2_dtype_spec(tier)[1]})" if _v2_reuse_ok(D) else f"{tier}(TG)"
+        return f"v2r({_v2_dtype_spec(tier)[1]})" if _v2r_dtype_ok(D, tier) else f"{tier}(TG)"
     return tier  # v1, v0, torch
 
 
@@ -1137,10 +1161,11 @@ def _flash_v2_dtype(q, k, v, scale, causal, mode):
     """Experimental TensorOps v2 dtype specialization. No auto promotion yet."""
     B, Hq, Lq, D = q.shape
     Hkv, Lk = k.shape[1], k.shape[2]
-    # At small D, register-resident P (v2r) beats the threadgroup round-trip:
-    # bf16 ~2.5x, fp32 ~1.45x (and fp32 S in registers stays bit-exact). v2r
-    # loses at D>64 to register pressure, so _v2_reuse_ok gates it to D<=64.
-    if mode in ("v2_bf16", "v2_fp32") and _v2_reuse_ok(D):
+    # Register-resident P (v2r) beats the threadgroup round-trip: bf16 ~2.5x at
+    # D<=64 and ~1.23x at D=128; fp32 ~1.45x at D<=64 (bit-exact) but loses at
+    # D=128. _v2r_dtype_ok encodes the per-dtype D ceiling (bf16: all eligible D,
+    # fp32: D<=64).
+    if mode in ("v2_bf16", "v2_fp32") and _v2r_dtype_ok(D, mode):
         return _flash_v2r_dtype(q, k, v, scale, causal, _v2_dtype_spec(mode)[1])
     qc = q.contiguous()
     kc = k.contiguous()

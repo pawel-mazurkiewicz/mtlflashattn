@@ -115,18 +115,22 @@ def test_fp32_small_d_uses_register_resident_v2r(monkeypatch, causal):
     torch.testing.assert_close(out, ref, atol=2e-5, rtol=1e-4)
 
 
-def test_bf16_large_d_stays_on_tg_roundtrip(monkeypatch):
-    """bf16 at D=128 must NOT use v2r (register pressure loses there) -- it
-    keeps the threadgroup-round-trip dtype kernel."""
+def test_bf16_large_d_also_uses_v2r(monkeypatch):
+    """bf16 at D=128 ALSO uses v2r: SR=16 beats the threadgroup round-trip 1.23x
+    (22.5 vs 18.3 TF/s at L=26k). Only fp32 loses at D=128 (register pressure)."""
     from metal_flash_attn import _kernel
 
     require_v2()
     monkeypatch.setenv("MTLFLASHATTN_KERNEL", "v2_bf16")
 
-    def fail(*a, **kw):
-        raise AssertionError("bf16 D=128 must not use the v2r register path")
+    called = []
+    orig = _kernel._flash_v2r_dtype
 
-    monkeypatch.setattr(_kernel, "_flash_v2r_dtype", fail)
+    def spy(*a, **kw):
+        called.append(True)
+        return orig(*a, **kw)
+
+    monkeypatch.setattr(_kernel, "_flash_v2r_dtype", spy)
 
     g = torch.Generator(device="cpu").manual_seed(53)
     q = torch.randn(1, 4, 160, 128, generator=g).to("mps", torch.bfloat16)
@@ -136,8 +140,34 @@ def test_bf16_large_d_stays_on_tg_roundtrip(monkeypatch):
 
     out = _kernel.flash_attn_forward(q, k, v, scale=scale, causal=False)
     ref = ref_attention(q, k, v, scale=scale, causal=False)
+    assert called, "bf16 D=128 did not use the register-resident v2r kernel"
     assert out.dtype == torch.bfloat16
     torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)
+
+
+def test_fp32_large_d_stays_on_tg_roundtrip(monkeypatch):
+    """fp32 at D=128 must NOT use v2r -- the fp32 S/O register pressure makes it
+    a wash/loss there, so it keeps the threadgroup-round-trip dtype kernel."""
+    from metal_flash_attn import _kernel
+
+    require_v2()
+    monkeypatch.setenv("MTLFLASHATTN_KERNEL", "v2_fp32")
+
+    def fail(*a, **kw):
+        raise AssertionError("fp32 D=128 must not use the v2r register path")
+
+    monkeypatch.setattr(_kernel, "_flash_v2r_dtype", fail)
+
+    g = torch.Generator(device="cpu").manual_seed(59)
+    q = torch.randn(1, 4, 160, 128, generator=g).to("mps", torch.float32)
+    k = torch.randn(1, 2, 192, 128, generator=g).to("mps", torch.float32)
+    v = torch.randn(1, 2, 192, 128, generator=g).to("mps", torch.float32)
+    scale = 1.0 / math.sqrt(128)
+
+    out = _kernel.flash_attn_forward(q, k, v, scale=scale, causal=False)
+    ref = ref_attention(q, k, v, scale=scale, causal=False)
+    assert out.dtype == torch.float32
+    torch.testing.assert_close(out, ref, atol=2e-5, rtol=1e-4)
 
 
 @pytest.mark.parametrize("causal", [False, True])
