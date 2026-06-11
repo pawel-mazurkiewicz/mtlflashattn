@@ -41,9 +41,11 @@ def make_qkv(B, Lq, Lk, Hq, Hkv, D, dtype, seed=0):
     return q, k, v
 
 
+# Tier-agnostic: fp16 may route through v1 (half-accumulated QK^T => ~1-2%
+# worst-case on isolated elements); fp32/bf16 run v0 (fp32 accumulation).
 TOL = {
     torch.float32: dict(atol=2e-5, rtol=1e-4),
-    torch.float16: dict(atol=2e-3, rtol=1e-2),
+    torch.float16: dict(atol=1.5e-2, rtol=2e-2),
     torch.bfloat16: dict(atol=2e-2, rtol=2e-2),
 }
 
