@@ -371,7 +371,7 @@ kernel void flash_attn_fwd_v2(
 // round-trips for S or P. K/V are padded to BC multiples by the dispatcher
 // (static k means the tail block reads a full BC rows).
 
-constant constexpr int SR = 16;   // query rows per simdgroup (v2r)
+constant constexpr int SR = @SR@;   // query rows per simdgroup (v2r); chosen by D
 
 kernel void flash_attn_fwd_v2r(
     device half*  Q  [[buffer(0)]],   // [B,Hq,Lq,DD]
@@ -567,10 +567,18 @@ def _v2_reuse_ok(D):
     return ok
 
 
+def _v2r_sr(D):
+    # Measured (M5 Max, D=128 L=8k): SR=16 -> 16.6 TF/s, SR=8 -> 7.1 TF/s (m=8
+    # tiles waste the native 16-row matmul granularity; register relief doesn't
+    # pay for it). SR=16 everywhere; v2r is only auto-picked for D<=64 anyway.
+    return 16
+
+
 def _get_v2_lib(D):
     lib = _v2_libs.get(D)
     if lib is None:
-        lib = torch.mps.compile_shader(_V2_MSL.replace("@D@", str(D)))
+        src = _V2_MSL.replace("@D@", str(D)).replace("@SR@", str(_v2r_sr(D)))
+        lib = torch.mps.compile_shader(src)
         _v2_libs[D] = lib
     return lib
 
@@ -683,7 +691,8 @@ def _flash_v2(q, k, v, scale, causal):
             [B, Hq, Hkv, Lq, Lk, 1 if causal else 0, Lkp],
             dtype=torch.int32, device=q.device,
         )
-        ntg_x = -(-Lq // 64)  # 4 simdgroups x SR=16 rows per threadgroup
+        rows_per_tg = _v2r_sr(D) * 4  # 4 simdgroups x SR rows
+        ntg_x = -(-Lq // rows_per_tg)
         lib.flash_attn_fwd_v2r(
             qc, kc, vc, out, sh, pr,
             threads=(ntg_x * 128, B * Hq, 1), group_size=(128, 1, 1),
