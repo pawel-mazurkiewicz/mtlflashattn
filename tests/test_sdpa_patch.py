@@ -105,3 +105,81 @@ class TestSdpaPatch:
         orig = F.scaled_dot_product_attention
         assert not sdpa.install(min_score_gb=1e-9)
         assert F.scaled_dot_product_attention is orig
+
+
+def _require_v2():
+    from metal_flash_attn import _kernel
+
+    if not _kernel._v2_supported():
+        pytest.skip("v2 TensorOps kernel not supported on this machine")
+
+
+@mps_only
+class TestSdpaGate:
+    """The patch fires for fast TensorOps tiers even when memory fits, and on
+    correctness grounds at large sequences (stock MPS fused SDPA is silently
+    wrong past ~4k tokens), while keeping tiny attention on stock."""
+
+    def test_fast_tier_fires_when_memory_fits(self):
+        from metal_flash_attn import sdpa
+
+        _require_v2()
+        # fp16 D=64 -> v2; L=2048 fits well under 12 GB but is 3-4x faster on v2
+        q, k, v = make_bhld(1, 4, 2048, 2048, 64)
+        assert sdpa.install()  # DEFAULT 12 GB threshold
+        try:
+            ok, reason = sdpa._eligibility(q, k, v, None, 0.0, False)
+        finally:
+            sdpa.uninstall()
+        assert ok and reason == "fast-tier", reason
+
+    def test_tiny_fast_tier_stays_stock(self):
+        from metal_flash_attn import sdpa
+
+        # below the fast floor and the correctness floor, and it fits -> stock
+        q, k, v = make_bhld(1, 2, 64, 64, 64)
+        assert sdpa.install()  # default threshold
+        try:
+            ok, reason = sdpa._eligibility(q, k, v, None, 0.0, False)
+        finally:
+            sdpa.uninstall()
+        assert not ok and reason.startswith("fits"), reason
+
+    def test_large_seq_fires_for_correctness_on_slow_tier(self):
+        from metal_flash_attn import sdpa
+
+        # D=100 is not a multiple of 8 -> slow v0 tier, but at L=4096 stock is
+        # numerically wrong, so route to our (exact) kernel anyway.
+        q, k, v = make_bhld(1, 2, 4096, 4096, 100)
+        assert sdpa.install()  # default 12 GB; score here is ~67 MB
+        try:
+            ok, reason = sdpa._eligibility(q, k, v, None, 0.0, False)
+        finally:
+            sdpa.uninstall()
+        assert ok and reason == "correctness-large-seq", reason
+
+    def test_fast_floor_is_env_configurable(self, monkeypatch):
+        from metal_flash_attn import sdpa
+
+        _require_v2()
+        q, k, v = make_bhld(1, 2, 512, 512, 64)  # fp16 v2, L=512
+        monkeypatch.setenv("MTLFLASHATTN_SDPA_FAST_MIN_SEQ", "256")
+        assert sdpa.install()
+        try:
+            ok, reason = sdpa._eligibility(q, k, v, None, 0.0, False)
+        finally:
+            sdpa.uninstall()
+        assert ok and reason == "fast-tier", reason
+
+    def test_correctness_floor_is_env_configurable(self, monkeypatch):
+        from metal_flash_attn import sdpa
+
+        # slow tier (D=100), L=512: only fires if the correctness floor is lowered
+        q, k, v = make_bhld(1, 2, 512, 512, 100)
+        monkeypatch.setenv("MTLFLASHATTN_SDPA_MIN_SEQ", "256")
+        assert sdpa.install()
+        try:
+            ok, reason = sdpa._eligibility(q, k, v, None, 0.0, False)
+        finally:
+            sdpa.uninstall()
+        assert ok and reason == "correctness-large-seq", reason

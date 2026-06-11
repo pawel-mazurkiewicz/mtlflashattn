@@ -16,12 +16,18 @@ import os
 import torch
 import torch.nn.functional as F
 
-from ._kernel import MAX_HEAD_DIM, flash_attn_forward
+from ._kernel import MAX_HEAD_DIM, _select_tier, flash_attn_forward
 
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
+# TensorOps tiers that beat stock fused SDPA by 3-4x (or more, causal); worth
+# routing even when the score matrix would fit in memory.
+_FAST_TIERS = frozenset({"v2", "v2_fp32", "v2_bf16"})
+
 _orig = None
 _min_score_bytes = None
+_min_seq = None       # correctness gate: stock MPS fused SDPA is wrong past ~4k
+_fast_min_seq = None  # speed gate floor: tiny attention stays on stock
 
 
 def _eligibility(q, k, v, attn_mask, dropout_p, is_causal):
@@ -49,10 +55,22 @@ def _eligibility(q, k, v, attn_mask, dropout_p, is_causal):
     # (CUDA flash-attn convention). Identical only when Lq == Lk.
     if is_causal and Lq != Lk:
         return False, "causal-cross-length"
+    maxlen = max(Lq, Lk)
+    # 1. Correctness: stock MPS fused SDPA is silently numerically wrong past
+    #    ~4k tokens (per-element errors up to ~28 on real DiT q/k/v). Route to
+    #    our (exact, or fp32-accumulating) kernel regardless of tier or memory.
+    if maxlen >= _min_seq:
+        return True, "correctness-large-seq"
+    # 2. Speed: a fast TensorOps tier is 3-4x faster than stock even when the
+    #    score matrix fits; fire above a modest floor (tiny attention is cheap
+    #    and stock is fine there).
+    if maxlen >= _fast_min_seq and _select_tier(q, k, v) in _FAST_TIERS:
+        return True, "fast-tier"
+    # 3. Memory: OOM rescue for slow tiers / many heads at moderate seq.
     score_bytes = q.shape[0] * Hq * Lq * Lk * 2
-    if score_bytes < _min_score_bytes:
-        return False, f"fits({score_bytes / 1024**3:.2f}GB)"
-    return True, "flash"
+    if score_bytes >= _min_score_bytes:
+        return True, "oom-rescue"
+    return False, f"fits({score_bytes / 1024**3:.2f}GB)"
 
 
 def _sdpa(query, key, value, attn_mask=None, dropout_p=0.0,
@@ -68,16 +86,28 @@ def _sdpa(query, key, value, attn_mask=None, dropout_p=0.0,
                  is_causal=is_causal, scale=scale, **kwargs)
 
 
-def install(min_score_gb=None):
-    """Patch F.scaled_dot_product_attention. Returns True if newly installed."""
-    global _orig, _min_score_bytes
+def install(min_score_gb=None, min_seq=None, fast_min_seq=None):
+    """Patch F.scaled_dot_product_attention. Returns True if newly installed.
+
+    Gates (any one fires the kernel): correctness (max seq >= min_seq, default
+    MTLFLASHATTN_SDPA_MIN_SEQ=4096), speed (fast TensorOps tier and max seq >=
+    fast_min_seq, default MTLFLASHATTN_SDPA_FAST_MIN_SEQ=1024), and memory
+    (score bytes >= min_score_gb, default MTLFLASHATTN_SDPA_MIN_GB=12).
+    """
+    global _orig, _min_score_bytes, _min_seq, _fast_min_seq
     if _orig is not None:
         return False
     if os.environ.get("MTLFLASHATTN_SDPA", "auto").lower() in ("off", "0", "false"):
         return False
     if min_score_gb is None:
         min_score_gb = float(os.environ.get("MTLFLASHATTN_SDPA_MIN_GB", "12"))
+    if min_seq is None:
+        min_seq = int(os.environ.get("MTLFLASHATTN_SDPA_MIN_SEQ", "4096"))
+    if fast_min_seq is None:
+        fast_min_seq = int(os.environ.get("MTLFLASHATTN_SDPA_FAST_MIN_SEQ", "1024"))
     _min_score_bytes = int(min_score_gb * (1024 ** 3))
+    _min_seq = min_seq
+    _fast_min_seq = fast_min_seq
     _orig = F.scaled_dot_product_attention
     F.scaled_dot_product_attention = _sdpa
     torch.nn.functional.scaled_dot_product_attention = _sdpa
@@ -86,11 +116,13 @@ def install(min_score_gb=None):
 
 def uninstall():
     """Restore the original op. Returns True if a patch was removed."""
-    global _orig, _min_score_bytes
+    global _orig, _min_score_bytes, _min_seq, _fast_min_seq
     if _orig is None:
         return False
     F.scaled_dot_product_attention = _orig
     torch.nn.functional.scaled_dot_product_attention = _orig
     _orig = None
     _min_score_bytes = None
+    _min_seq = None
+    _fast_min_seq = None
     return True
