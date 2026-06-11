@@ -17,6 +17,8 @@ __all__ = [
     "flash_attn_varlen_func",
     "flash_attn_qkvpacked_func",
     "flash_attn_kvpacked_func",
+    "flash_attn_varlen_qkvpacked_func",
+    "flash_attn_varlen_kvpacked_func",
     "__version__",
 ]
 
@@ -176,3 +178,29 @@ def flash_attn_kvpacked_func(q, kv, *args, **kwargs):
         )
     k, v = kv.unbind(dim=2)
     return flash_attn_func(q, k, v, *args, **kwargs)
+
+
+def flash_attn_varlen_qkvpacked_func(qkv, cu_seqlens, max_seqlen, *args, **kwargs):
+    """Drop-in for flash_attn.flash_attn_varlen_qkvpacked_func. qkv: [total, 3, H, D]."""
+    if qkv.dim() != 4 or qkv.shape[1] != 3:
+        raise ValueError(
+            f"metal_flash_attn: expected qkv [total,3,H,D], got {tuple(qkv.shape)}"
+        )
+    q, k, v = qkv.unbind(dim=1)
+    return flash_attn_varlen_func(
+        q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen, *args, **kwargs
+    )
+
+
+def flash_attn_varlen_kvpacked_func(
+    q, kv, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, *args, **kwargs
+):
+    """Drop-in for flash_attn.flash_attn_varlen_kvpacked_func. kv: [total_k, 2, Hkv, D]."""
+    if kv.dim() != 4 or kv.shape[1] != 2:
+        raise ValueError(
+            f"metal_flash_attn: expected kv [total,2,H,D], got {tuple(kv.shape)}"
+        )
+    k, v = kv.unbind(dim=1)
+    return flash_attn_varlen_func(
+        q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, *args, **kwargs
+    )
