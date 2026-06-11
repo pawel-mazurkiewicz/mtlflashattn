@@ -705,14 +705,22 @@ def _v2r_compat_probe(D):
     return ok
 
 
-def _v2r_dtype_ok(D, mode):
-    """Register-resident-P gate for the dtype kernels, by dtype and head dim.
-    Measured M5 Max (v2r SR=16 vs the threadgroup-round-trip dtype kernel):
+_V2R_MIN_LK = 256  # below this, v2r is slower AND less precise than the TG kernel
+
+
+def _v2r_dtype_ok(D, Lk, mode):
+    """Register-resident-P gate for the dtype kernels, by dtype, head dim, and
+    KV length. Measured M5 Max (v2r SR=16 vs the threadgroup-round-trip kernel):
       bf16: 2.5x at D<=64, 1.23x at D=128 -> all eligible D.
       fp32: 1.45x at D<=64, ~1.0x/loss at D=128 (fp32 S/O register pressure)
             -> D<=64 only.
-    MTLFLASHATTN_V2_PREUSE=1 forces all D, =0 disables."""
+    But v2r only amortizes past Lk~256 (it does the softmax reduction in the
+    element type, so few keys cost both speed and precision -- e.g. Lk=5 image-
+    conditioning cross-attention is 0.64x and 3x the error). Gate on Lk.
+    MTLFLASHATTN_V2_PREUSE=1 forces D ceiling (not the Lk floor), =0 disables."""
     if D % 8 != 0 or D > MAX_HEAD_DIM:
+        return False
+    if Lk < _V2R_MIN_LK:
         return False
     env = os.environ.get("MTLFLASHATTN_V2_PREUSE", "auto").lower()
     if env in ("0", "off", "false"):
@@ -942,8 +950,9 @@ def _effective_kernel_label(q, k, v):
         return "torch"
     if mode == "v2_dtype" or mode == "v2_typed":
         mode = _v2_mode_for_runtime_dtype(q.dtype) or "v0"
+    Lk = k.shape[2]
     if mode in ("v2_bf16", "v2_fp32"):
-        return f"v2r({_v2_dtype_spec(mode)[1]})" if _v2r_dtype_ok(D, mode) else f"{mode}(TG)"
+        return f"v2r({_v2_dtype_spec(mode)[1]})" if _v2r_dtype_ok(D, Lk, mode) else f"{mode}(TG)"
     if mode == "v2":
         return "v2r" if _v2_reuse_ok(D) else "v2"
     if mode == "v1":
@@ -955,7 +964,7 @@ def _effective_kernel_label(q, k, v):
     if tier == "v2":
         return "v2r" if _v2_reuse_ok(D) else "v2"
     if tier in ("v2_fp32", "v2_bf16"):
-        return f"v2r({_v2_dtype_spec(tier)[1]})" if _v2r_dtype_ok(D, tier) else f"{tier}(TG)"
+        return f"v2r({_v2_dtype_spec(tier)[1]})" if _v2r_dtype_ok(D, Lk, tier) else f"{tier}(TG)"
     return tier  # v1, v0, torch
 
 
@@ -1165,7 +1174,7 @@ def _flash_v2_dtype(q, k, v, scale, causal, mode):
     # D<=64 and ~1.23x at D=128; fp32 ~1.45x at D<=64 (bit-exact) but loses at
     # D=128. _v2r_dtype_ok encodes the per-dtype D ceiling (bf16: all eligible D,
     # fp32: D<=64).
-    if mode in ("v2_bf16", "v2_fp32") and _v2r_dtype_ok(D, mode):
+    if mode in ("v2_bf16", "v2_fp32") and _v2r_dtype_ok(D, Lk, mode):
         return _flash_v2r_dtype(q, k, v, scale, causal, _v2_dtype_spec(mode)[1])
     qc = q.contiguous()
     kc = k.contiguous()

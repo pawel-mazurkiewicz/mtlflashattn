@@ -133,14 +133,40 @@ def test_bf16_large_d_also_uses_v2r(monkeypatch):
     monkeypatch.setattr(_kernel, "_flash_v2r_dtype", spy)
 
     g = torch.Generator(device="cpu").manual_seed(53)
-    q = torch.randn(1, 4, 160, 128, generator=g).to("mps", torch.bfloat16)
-    k = torch.randn(1, 2, 192, 128, generator=g).to("mps", torch.bfloat16)
-    v = torch.randn(1, 2, 192, 128, generator=g).to("mps", torch.bfloat16)
+    q = torch.randn(1, 4, 320, 128, generator=g).to("mps", torch.bfloat16)
+    k = torch.randn(1, 2, 320, 128, generator=g).to("mps", torch.bfloat16)
+    v = torch.randn(1, 2, 320, 128, generator=g).to("mps", torch.bfloat16)
     scale = 1.0 / math.sqrt(128)
 
     out = _kernel.flash_attn_forward(q, k, v, scale=scale, causal=False)
     ref = ref_attention(q, k, v, scale=scale, causal=False)
     assert called, "bf16 D=128 did not use the register-resident v2r kernel"
+    assert out.dtype == torch.bfloat16
+    torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)
+
+
+def test_v2r_skipped_for_tiny_kv_length(monkeypatch):
+    """Below Lk=256 v2r is both slower AND less precise (bf16 softmax reduction
+    over few keys), so cross-attention with a tiny KV (e.g. image conditioning,
+    Lk=5) must stay on the threadgroup round-trip."""
+    from metal_flash_attn import _kernel
+
+    require_v2()
+    monkeypatch.setenv("MTLFLASHATTN_KERNEL", "v2_bf16")
+
+    def fail(*a, **kw):
+        raise AssertionError("tiny-Lk attention must not use v2r")
+
+    monkeypatch.setattr(_kernel, "_flash_v2r_dtype", fail)
+
+    g = torch.Generator(device="cpu").manual_seed(61)
+    q = torch.randn(1, 16, 4096, 128, generator=g).to("mps", torch.bfloat16)
+    k = torch.randn(1, 16, 5, 128, generator=g).to("mps", torch.bfloat16)
+    v = torch.randn(1, 16, 5, 128, generator=g).to("mps", torch.bfloat16)
+    scale = 1.0 / math.sqrt(128)
+
+    out = _kernel.flash_attn_forward(q, k, v, scale=scale, causal=False)
+    ref = ref_attention(q, k, v, scale=scale, causal=False)
     assert out.dtype == torch.bfloat16
     torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)
 
