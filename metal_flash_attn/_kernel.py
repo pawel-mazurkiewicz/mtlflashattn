@@ -1136,6 +1136,36 @@ def _flash_torch(q, k, v, scale, causal):
     return out.to(q.dtype)
 
 
+# Per-call dispatch tensors (shape `sh`, scale `pr`) are read-only kernel inputs.
+# Building them via torch.tensor([...], device='mps') costs ~270us each (alloc +
+# host->device copy + sync) — ~90% of a tiny Lk=5 cross-attention call. They are
+# value-stable for a given key, so cache and reuse them: sharing one tensor across
+# async dispatches is safe because the kernel only reads them and the contents
+# never change for a given key.
+_sh_cache = {}
+_pr_cache = {}
+
+
+def _sh_tensor(values, device):
+    """Cached read-only int32 shape tensor for kernel dispatch (see note above)."""
+    key = (tuple(int(x) for x in values), str(device))
+    t = _sh_cache.get(key)
+    if t is None:
+        t = torch.tensor(list(values), dtype=torch.int32, device=device)
+        _sh_cache[key] = t
+    return t
+
+
+def _pr_tensor(scale, device):
+    """Cached read-only fp32 scale tensor for kernel dispatch (see note above)."""
+    key = (float(scale), str(device))
+    t = _pr_cache.get(key)
+    if t is None:
+        t = torch.tensor([float(scale)], dtype=torch.float32, device=device)
+        _pr_cache[key] = t
+    return t
+
+
 def _flash_v2r_dtype(q, k, v, scale, causal, et):
     """Register-resident-P v2r kernel in element type `et` (bf16). Mirrors the
     fp16 v2r dispatch: static-k PV reads full BC-row tiles, so pad K/V to a BC
@@ -1148,15 +1178,12 @@ def _flash_v2r_dtype(q, k, v, scale, causal, et):
     kc = k.contiguous()
     vc = v.contiguous()
     out = torch.empty(B, Hq, Lq, D, device=q.device, dtype=q.dtype)
-    pr = torch.tensor([float(scale)], dtype=torch.float32, device=q.device)
+    pr = _pr_tensor(scale, q.device)
     Lkp = -(-Lk // 32) * 32
     if Lkp != Lk:
         kc = F.pad(kc, (0, 0, 0, Lkp - Lk))
         vc = F.pad(vc, (0, 0, 0, Lkp - Lk))
-    sh = torch.tensor(
-        [B, Hq, Hkv, Lq, Lk, 1 if causal else 0, Lkp],
-        dtype=torch.int32, device=q.device,
-    )
+    sh = _sh_tensor([B, Hq, Hkv, Lq, Lk, 1 if causal else 0, Lkp], q.device)
     rows_per_tg = _v2r_sr(D) * 4
     ntg_x = -(-Lq // rows_per_tg)
     _get_v2r_dtype_lib(D, et).flash_attn_fwd_v2r_dtype(
@@ -1180,11 +1207,8 @@ def _flash_v2_dtype(q, k, v, scale, causal, mode):
     kc = k.contiguous()
     vc = v.contiguous()
     out = torch.empty(B, Hq, Lq, D, device=q.device, dtype=q.dtype)
-    sh = torch.tensor(
-        [B, Hq, Hkv, Lq, Lk, 1 if causal else 0],
-        dtype=torch.int32, device=q.device,
-    )
-    pr = torch.tensor([float(scale)], dtype=torch.float32, device=q.device)
+    sh = _sh_tensor([B, Hq, Hkv, Lq, Lk, 1 if causal else 0], q.device)
+    pr = _pr_tensor(scale, q.device)
     ntg_x = -(-Lq // 32)
     _get_v2_dtype_lib(D, mode).flash_attn_fwd_v2_dtype(
         qc, kc, vc, out, sh, pr,
@@ -1203,7 +1227,7 @@ def _flash_v2(q, k, v, scale, causal):
     kc = k.contiguous()
     vc = v.contiguous()
     out = torch.empty(B, Hq, Lq, D, device=q.device, dtype=torch.float16)
-    pr = torch.tensor([float(scale)], dtype=torch.float32, device=q.device)
+    pr = _pr_tensor(scale, q.device)
     lib = _get_v2_lib(D)
     if _v2_reuse_ok(D):
         # v2r: static-k PV reads full BC-row tiles — pad K/V to a BC multiple
@@ -1211,10 +1235,7 @@ def _flash_v2(q, k, v, scale, causal):
         if Lkp != Lk:
             kc = F.pad(kc, (0, 0, 0, Lkp - Lk))
             vc = F.pad(vc, (0, 0, 0, Lkp - Lk))
-        sh = torch.tensor(
-            [B, Hq, Hkv, Lq, Lk, 1 if causal else 0, Lkp],
-            dtype=torch.int32, device=q.device,
-        )
+        sh = _sh_tensor([B, Hq, Hkv, Lq, Lk, 1 if causal else 0, Lkp], q.device)
         rows_per_tg = _v2r_sr(D) * 4  # 4 simdgroups x SR rows
         ntg_x = -(-Lq // rows_per_tg)
         lib.flash_attn_fwd_v2r(
@@ -1222,10 +1243,7 @@ def _flash_v2(q, k, v, scale, causal):
             threads=(ntg_x * 128, B * Hq, 1), group_size=(128, 1, 1),
         )
         return out
-    sh = torch.tensor(
-        [B, Hq, Hkv, Lq, Lk, 1 if causal else 0],
-        dtype=torch.int32, device=q.device,
-    )
+    sh = _sh_tensor([B, Hq, Hkv, Lq, Lk, 1 if causal else 0], q.device)
     ntg_x = -(-Lq // 32)  # BR=32 query rows per threadgroup
     lib.flash_attn_fwd_v2(
         qc, kc, vc, out, sh, pr,
@@ -1251,11 +1269,8 @@ def _flash_v1(q, k, v, scale, causal):
         kc = F.pad(kc, (0, 0, 0, Lkp - Lk))
         vc = F.pad(vc, (0, 0, 0, Lkp - Lk))
     out = torch.empty(B, Hq, Lq, D, device=q.device, dtype=torch.float16)
-    sh = torch.tensor(
-        [B, Hq, Hkv, Lq, Lk, Lqp, Lkp, D, 1 if causal else 0],
-        dtype=torch.int32, device=q.device,
-    )
-    pr = torch.tensor([float(scale)], dtype=torch.float32, device=q.device)
+    sh = _sh_tensor([B, Hq, Hkv, Lq, Lk, Lqp, Lkp, D, 1 if causal else 0], q.device)
+    pr = _pr_tensor(scale, q.device)
     ntg_x = -(-Lqp // 32)  # 32 query rows per threadgroup (4 simdgroups x 8)
     _get_lib().flash_attn_fwd_v1(
         qc, kc, vc, out, sh, pr,
@@ -1272,11 +1287,8 @@ def _flash_v0(q, k, v, scale, causal):
     kf = k.float().contiguous()
     vf = v.float().contiguous()
     out = torch.empty(B, Hq, Lq, D, device=q.device, dtype=torch.float32)
-    sh = torch.tensor(
-        [B, Hq, Hkv, Lq, Lk, D, 1 if causal else 0],
-        dtype=torch.int32, device=q.device,
-    )
-    pr = torch.tensor([float(scale)], dtype=torch.float32, device=q.device)
+    sh = _sh_tensor([B, Hq, Hkv, Lq, Lk, D, 1 if causal else 0], q.device)
+    pr = _pr_tensor(scale, q.device)
     _get_lib().flash_attn_fwd(
         qf, kf, vf, out, sh, pr,
         threads=(Lq, B * Hq, 1), group_size=(64, 1, 1),
