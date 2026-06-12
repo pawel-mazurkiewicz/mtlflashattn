@@ -156,9 +156,11 @@ FlexAttention are not implemented (the shim raises so callers fall back).
 
 The full build log — the TensorOps/MPP API gotchas discovered empirically on macOS 27 beta
 (`tensor::slice()` reads wrong data as a `matmul2d` operand; operand extents must be clamped;
-tensor destinations always accumulate; `reduce_rows` requires single-simdgroup scope; the
-register-resident P recipe forces the S element type to match the left input), the per-tier
-design, and the speed/precision analysis — lives in
+tensor destinations always accumulate; `reduce_rows` requires single-simdgroup scope and its
+row-reduction output is per-thread *co-located* with the source — the reduced value for row `r`
+sits on every lane that owns row `r`'s columns, with the reduction's row index at `idx[0]` vs the
+source's at `idx[1]`; the register-resident P recipe forces the S element type to match the left
+input), the per-tier design, and the speed/precision analysis — lives in
 [`METAL_FLASH_ATTN_PLAN.md`](METAL_FLASH_ATTN_PLAN.md).
 
 ## License
