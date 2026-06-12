@@ -160,8 +160,8 @@ tensor destinations always accumulate; `reduce_rows` requires single-simdgroup s
 row-reduction output is per-thread *co-located* with the source — the reduced value for row `r`
 sits on every lane that owns row `r`'s columns, with the reduction's row index at `idx[0]` vs the
 source's at `idx[1]`; the register-resident P recipe forces the S element type to match the left
-input), the per-tier design, and the speed/precision analysis — lives in
-[`METAL_FLASH_ATTN_PLAN.md`](METAL_FLASH_ATTN_PLAN.md).
+input), the per-tier design, and the speed/precision analysis are documented inline in the kernel
+source (`metal_flash_attn/_kernel.py`).
 
 ## License
 

@@ -1,8 +1,8 @@
 """Per-call dispatch overhead: the v2 dispatch builds a small int32 `sh` shape
 tensor and a float `pr` scale tensor for every attention call. Measured cost of
 `torch.tensor([...], device='mps')` is ~270 us each (alloc + H2D + sync), which is
-~90% of a tiny Lk=5 cross-attention call (~990 such calls in the Pixal3D
-workload). Caching the read-only sh/pr tensors by (values, device) / (scale,
+~90% of a tiny Lk=5 cross-attention call (~990 such calls in a real
+diffusion workload). Caching the read-only sh/pr tensors by (values, device) / (scale,
 device) drops it to ~0.1 us with identical kernel inputs.
 """
 import math

@@ -6,6 +6,3 @@ __pycache__/
 dist/
 .serena/
 .claude/
-SESSION_*_FINDINGS.md
-INVESTIGATION_FACTS.md
-OPTIMIZATION_BRIEF.md
