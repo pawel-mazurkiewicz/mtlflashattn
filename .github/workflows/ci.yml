@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  package:
+    name: Build & validate package (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Build sdist and wheel
+        run: uv build
+
+      - name: Check distribution metadata (README render, fields)
+        run: uvx twine check dist/*
+
+      - name: Assert no internal files leaked into the sdist
+        run: |
+          if tar -tzf dist/*.tar.gz | grep -E '(^|/)(dev/|METAL_FLASH_ATTN_PLAN|spike_compile_shader|INVESTIGATION_FACTS|OPTIMIZATION_BRIEF|SESSION_)' ; then
+            echo "::error::internal/dev file found in sdist"; exit 1
+          fi
+          echo "sdist is clean"
+
+  # The kernel/correctness suite needs Apple Silicon + macOS 26/27 to compile the
+  # v2 TensorOps (MetalPerformancePrimitives) path. GitHub-hosted macOS runners are
+  # macOS 14/15 and cannot build it, so the full suite runs on a self-hosted
+  # M-series / macOS 27 runner, triggered manually via "Run workflow".
+  #
+  # To enable: register a self-hosted runner with labels [self-hosted, macOS, ARM64]
+  # (Settings → Actions → Runners), then dispatch this workflow.
+  test-mps:
+    name: MPS test suite (self-hosted Apple Silicon)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: [self-hosted, macOS, ARM64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Run test suite
+        run: uv run --extra dev pytest -q
