@@ -1,6 +1,6 @@
 [project]
 name = "mtlflashattn"
-version = "0.1.0"
+version = "0.2.0"
 description = "Memory-efficient Metal flash-attention for PyTorch MPS, with a guarded flash_attn drop-in shim"
 readme = "README.md"
 requires-python = ">=3.10"
