@@ -73,6 +73,63 @@ def _eligibility(q, k, v, attn_mask, dropout_p, is_causal):
     return False, f"fits({score_bytes / 1024**3:.2f}GB)"
 
 
+def _uneven_v_attention(query, key, value, attn_mask, is_causal, scale, enable_gqa=False,
+                        q_chunk=4096):
+    """Defensive exact path for value_head_dim != query/key_head_dim.
+
+    Some torch/macOS versions have been observed to mishandle the wide-value case
+    in stock MPS SDPA (wrong-shaped or numerically wrong output) — notably with
+    Hunyuan3D's PBR reference attention, where per-material value projections are
+    concatenated into one tensor. Current torch (2.12) / macOS 27 handles it
+    correctly, so this is insurance rather than a fix for a reproducing bug: we
+    compute it directly, fp32-accumulated and chunked over the query length so the
+    Lq x Lk score matrix never has to be fully materialized.
+    """
+    Hq, Hkv = query.shape[1], key.shape[1]
+    # Expand kv heads only when the caller opted into GQA — mirroring stock SDPA,
+    # which rejects unequal head counts unless enable_gqa=True. We raise a clean
+    # error here rather than defer to stock: on MPS the unequal-heads case
+    # hard-aborts the process (LLVM ERROR), which would crash the caller.
+    if Hq != Hkv:
+        if not (enable_gqa and Hkv != 0 and Hq % Hkv == 0):
+            raise ValueError(
+                f"metal_flash_attn: SDPA query/kv head mismatch (Hq={Hq}, Hkv={Hkv}); "
+                "pass enable_gqa=True for GQA/MQA"
+            )
+        rep = Hq // Hkv
+        key = key.repeat_interleave(rep, dim=1)
+        value = value.repeat_interleave(rep, dim=1)
+
+    s = scale if scale is not None else 1.0 / math.sqrt(query.shape[-1])
+    Lq, Lk = query.shape[-2], key.shape[-2]
+
+    bias = None
+    if attn_mask is not None:
+        if attn_mask.dtype == torch.bool:
+            bias = torch.zeros(attn_mask.shape, dtype=torch.float32, device=query.device)
+            bias = bias.masked_fill(~attn_mask, float("-inf"))
+        else:
+            bias = attn_mask.float()
+
+    key_t = key.float().transpose(-2, -1)
+    value_f = value.float()
+    outs = []
+    for i in range(0, Lq, q_chunk):
+        qi = query[..., i:i + q_chunk, :].float()
+        scores = torch.matmul(qi, key_t) * s
+        if bias is not None:
+            scores = scores + (bias[..., i:i + qi.shape[-2], :] if bias.shape[-2] == Lq else bias)
+        if is_causal:  # top-left aligned, matching torch SDPA semantics
+            qpos = torch.arange(i, i + qi.shape[-2], device=query.device).unsqueeze(-1)
+            kpos = torch.arange(Lk, device=query.device).unsqueeze(0)
+            scores = scores.masked_fill(kpos > qpos, float("-inf"))
+        # fully masked rows (bool mask or additive -inf) make softmax emit NaN;
+        # zero them like ref_attention does, rather than propagating NaN.
+        probs = torch.nan_to_num(scores.softmax(dim=-1), nan=0.0)
+        outs.append(torch.matmul(probs, value_f))
+    return torch.cat(outs, dim=-2).to(value.dtype)
+
+
 def _sdpa(query, key, value, attn_mask=None, dropout_p=0.0,
           is_causal=False, scale=None, **kwargs):
     eligible, _ = _eligibility(query, key, value, attn_mask, dropout_p, is_causal)
@@ -82,6 +139,14 @@ def _sdpa(query, key, value, attn_mask=None, dropout_p=0.0,
             return flash_attn_forward(query, key, value, scale=s, causal=is_causal)
         except Exception as e:  # never crash — fall back to stock SDPA
             print(f"[metal_flash_attn/sdpa] kernel fell back ({e}); using stock SDPA")
+    # Defensive shield for value_head_dim != query_head_dim: some torch/macOS
+    # versions have mishandled the wide-value case (current torch handles it). Cheap
+    # insurance — compute it exactly ourselves rather than trust the stock path.
+    if (query.device.type == "mps" and not dropout_p
+            and query.dim() == 4 and value.dim() == 4
+            and value.shape[-1] != query.shape[-1]):
+        return _uneven_v_attention(query, key, value, attn_mask, is_causal, scale,
+                                   enable_gqa=kwargs.get("enable_gqa", False))
     return _orig(query, key, value, attn_mask=attn_mask, dropout_p=dropout_p,
                  is_causal=is_causal, scale=scale, **kwargs)
 

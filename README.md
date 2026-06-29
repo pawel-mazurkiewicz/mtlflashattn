@@ -60,8 +60,10 @@ out = flash_attn_func(q, k, v, causal=True)
 Exposes the CUDA flash-attn surface: `flash_attn_func`, `flash_attn_varlen_func`,
 `flash_attn_qkvpacked_func`, `flash_attn_kvpacked_func`, `flash_attn_varlen_qkvpacked_func`,
 `flash_attn_varlen_kvpacked_func`, and the `flash_attn.flash_attn_interface` submodule.
-Unsupported features (dropout, alibi, softcap, `return_attn_probs`, sliding window, D>128,
-backward) **raise `NotImplementedError`** so callers fall back rather than get wrong results.
+Logit soft-capping (`softcap=`), sliding-window attention (`window_size=`), and ALiBi
+(`alibi_slopes=`) are supported on all kernel tiers. Unsupported features (dropout,
+`return_attn_probs`, D>128, backward) **raise `NotImplementedError`** so
+callers fall back rather than get wrong results.
 
 ### 2. Direct API
 
@@ -83,6 +85,14 @@ Fires on three gates: **correctness** (`max(Lq,Lk) ≥ MTLFLASHATTN_SDPA_MIN_SEQ
 **speed** (a fast TensorOps tier above `MTLFLASHATTN_SDPA_FAST_MIN_SEQ`, default 1024), and
 **memory** (`MTLFLASHATTN_SDPA_MIN_GB`, default 12). Tiny attention stays on stock. Never
 crashes the caller — any kernel error falls through to the original op.
+
+Independently of those gates, a **defensive uneven-V shield** computes attention directly
+(chunked fp32, query-tiled) whenever value's head_dim differs from query/key's. Some torch/macOS
+versions have been observed to mishandle this wide-value case in stock MPS SDPA (notably with
+Hunyuan3D's PBR reference attention, where per-material value projections are concatenated);
+current torch (2.12) / macOS 27 handles it correctly, so this is cheap insurance rather than a
+fix for a reproducing bug. This path matches torch SDPA semantics, including **top-left**
+`causal` alignment (vs the kernel's bottom-right convention).
 
 ## Kernel tiers
 
@@ -149,8 +159,11 @@ Reproduce: `python bench/bench_attn.py` (fp16) and `python dev/bench_dtype_kerne
 ## Scope
 
 Inference forward pass only (no backward). Supports `softmax_scale`, bottom-right `causal`,
-GQA/MQA, fp16/bf16/fp32, D≤128. Sliding window, dropout, alibi, softcap, KV-cache decode, and
-FlexAttention are not implemented (the shim raises so callers fall back).
+GQA/MQA, fp16/bf16/fp32, D≤128, logit soft-capping (`softcap`), sliding-window attention
+(`window_size`), and ALiBi (`alibi_slopes`). The SDPA patch additionally
+carries a defensive exact path for the uneven-V case (value head_dim ≠ query/key head_dim) that
+some MPS versions mishandle. Dropout, KV-cache decode, and FlexAttention are not
+implemented (the shim raises so callers fall back).
 
 ## How it works / engineering notes
 

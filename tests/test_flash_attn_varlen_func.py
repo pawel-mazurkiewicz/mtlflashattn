@@ -19,15 +19,17 @@ def make_varlen(seqlens_q, seqlens_k, Hq, Hkv, D, dtype, seed=0):
     return q, k, v, cu_q, cu_k
 
 
-def ref_varlen(q, k, v, cu_q, cu_k, causal=False, scale=None):
+def ref_varlen(q, k, v, cu_q, cu_k, causal=False, scale=None, alibi_slopes=None):
     outs = []
     for i in range(len(cu_q) - 1):
         qs = q[cu_q[i]:cu_q[i + 1]]      # [Lq_i, Hq, D]
         ks = k[cu_k[i]:cu_k[i + 1]]
         vs = v[cu_k[i]:cu_k[i + 1]]
+        slopes_i = alibi_slopes[i] if (alibi_slopes is not None and alibi_slopes.dim() == 2) \
+            else alibi_slopes
         o = ref_attention(
             qs.permute(1, 0, 2)[None], ks.permute(1, 0, 2)[None],
-            vs.permute(1, 0, 2)[None], causal=causal, scale=scale,
+            vs.permute(1, 0, 2)[None], causal=causal, scale=scale, alibi_slopes=slopes_i,
         )[0].permute(1, 0, 2)            # [Lq_i, Hq, D] fp32
         outs.append(o)
     return torch.cat(outs, dim=0)
@@ -63,6 +65,36 @@ class TestFlashAttnVarlenFunc:
 
     def test_gqa(self):
         check_varlen([40, 24], [40, 24], Hq=8, Hkv=2, causal=True, dtype=torch.float16)
+
+    def test_batched_alibi_slopes(self):
+        # [batch, Hq] slopes: each packed sequence must get its own row
+        from metal_flash_attn import flash_attn_varlen_func
+
+        seqlens = [40, 24]
+        q, k, v, cu_q, cu_k = make_varlen(seqlens, seqlens, 4, 4, 64, torch.float32)
+        slopes = torch.tensor(
+            [[0.5, 0.25, 0.125, 0.0625], [0.1, 0.2, 0.3, 0.4]], device="mps"
+        )  # [batch=2, Hq=4]
+        out = flash_attn_varlen_func(
+            q, k, v, cu_q, cu_k,
+            max_seqlen_q=max(seqlens), max_seqlen_k=max(seqlens), alibi_slopes=slopes,
+        )
+        ref = ref_varlen(q, k, v, cu_q, cu_k, alibi_slopes=slopes)
+        torch.testing.assert_close(out.float(), ref, **TOL[torch.float32])
+
+    def test_per_head_alibi_slopes(self):
+        # [Hq] slopes shared across all packed sequences
+        from metal_flash_attn import flash_attn_varlen_func
+
+        seqlens = [40, 24]
+        q, k, v, cu_q, cu_k = make_varlen(seqlens, seqlens, 4, 4, 64, torch.float32)
+        slopes = torch.tensor([0.5, 0.25, 0.125, 0.0625], device="mps")  # [Hq=4]
+        out = flash_attn_varlen_func(
+            q, k, v, cu_q, cu_k,
+            max_seqlen_q=max(seqlens), max_seqlen_k=max(seqlens), alibi_slopes=slopes,
+        )
+        ref = ref_varlen(q, k, v, cu_q, cu_k, alibi_slopes=slopes)
+        torch.testing.assert_close(out.float(), ref, **TOL[torch.float32])
 
     def test_single_sequence_matches_dense(self):
         from metal_flash_attn import flash_attn_func, flash_attn_varlen_func

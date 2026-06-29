@@ -13,8 +13,15 @@ from __future__ import annotations
 import atexit
 import os
 import platform
+from collections import namedtuple
 
 import torch
+
+# Bias/masking knobs threaded as one object through the _flash_* dispatchers.
+# softcap: logit soft-cap (0 = off). window_left/window_right: sliding-window key
+# bounds relative to the bottom-right diagonal (-1 = open). alibi: [B*Hq] fp32
+# per-head ALiBi slopes already broadcast, or None.
+_BiasParams = namedtuple("_BiasParams", "softcap window_left window_right alibi")
 
 MAX_HEAD_DIM = 128  # kernel uses a thread-local acc[128]
 
@@ -28,11 +35,16 @@ kernel void flash_attn_fwd(
     device const float* V   [[buffer(2)]],   // [B,Hkv,Lk,D]
     device float*       O   [[buffer(3)]],   // [B,Hq,Lq,D]
     device const int*   SH  [[buffer(4)]],   // [B,Hq,Hkv,Lq,Lk,D,causal]
-    device const float* PR  [[buffer(5)]],   // [scale]
+    device const float* PR  [[buffer(5)]],   // [scale, softcap, win_l, win_r, alibi_on]
+    device const float* AL  [[buffer(6)]],   // [B*Hq] alibi slopes (read iff alibi_on)
     uint3 gid [[thread_position_in_grid]])
 {
     const int B=SH[0], Hq=SH[1], Hkv=SH[2], Lq=SH[3], Lk=SH[4], D=SH[5], causal=SH[6];
     const float scale = PR[0];
+    const float softcap = PR[1];
+    const int wl = int(PR[2]);   // sliding-window left bound, -1 = open
+    const int wr = int(PR[3]);   // sliding-window right bound, -1 = open
+    const int do_alibi = int(PR[4]);
 
     const int qi = int(gid.x);
     const int bh = int(gid.y);
@@ -44,19 +56,25 @@ kernel void flash_attn_fwd(
     const int q_base = ((b*Hq + hq)*Lq + qi)*D;
     const int kv_bh  = (b*Hkv + hkv);
 
-    // causal aligns bottom-right (key j attends iff j <= qi + (Lk-Lq))
-    const int kmax = causal ? (qi + (Lk - Lq) + 1) : Lk;
+    // causal aligns bottom-right (key j attends iff j <= qi + (Lk-Lq)); sliding
+    // window further bounds keys to [center - wl, center + wr] (wl/wr < 0 = open)
+    const int center = qi + (Lk - Lq);
+    int kmax = causal ? (center + 1) : Lk;
+    if (wr >= 0) kmax = min(kmax, center + wr + 1);
+    const int kmin = (wl >= 0) ? max(0, center - wl) : 0;
 
     float m = -INFINITY;
     float l = 0.0f;
     float acc[128];
     for (int d=0; d<D; ++d) acc[d]=0.0f;
 
-    for (int kj=0; kj<kmax; ++kj) {
+    for (int kj=kmin; kj<kmax; ++kj) {
         const int k_base = (kv_bh*Lk + kj)*D;
         float s = 0.0f;
         for (int d=0; d<D; ++d) s += Q[q_base+d]*K[k_base+d];
         s *= scale;
+        if (softcap > 0.0f) s = softcap * tanh(s / softcap);
+        if (do_alibi) s -= AL[bh] * float(abs(center - kj));
         float m_new = max(m, s);
         float corr  = exp(m - m_new);
         float p     = exp(s - m_new);
@@ -90,7 +108,8 @@ kernel void flash_attn_fwd_v1(
     device const half*  V   [[buffer(2)]],   // [B,Hkv,Lkp,D] padded
     device half*        O   [[buffer(3)]],   // [B,Hq,Lq,D] unpadded
     device const int*   SH  [[buffer(4)]],   // [B,Hq,Hkv,Lq,Lk,Lqp,Lkp,D,causal]
-    device const float* PR  [[buffer(5)]],   // [scale]
+    device const float* PR  [[buffer(5)]],   // [scale, softcap, win_l, win_r, alibi_on]
+    device const float* AL  [[buffer(6)]],   // [B*Hq] alibi slopes (read iff alibi_on)
     uint3 tgid [[threadgroup_position_in_grid]],
     uint  sgid [[simdgroup_index_in_threadgroup]],
     uint  lane [[thread_index_in_simdgroup]])
@@ -98,6 +117,10 @@ kernel void flash_attn_fwd_v1(
     const int Hq=SH[1], Hkv=SH[2], Lq=SH[3], Lk=SH[4],
               Lqp=SH[5], Lkp=SH[6], D=SH[7], causal=SH[8];
     const float scale = PR[0];
+    const float softcap = PR[1];
+    const int wl = int(PR[2]);   // sliding-window left bound, -1 = open
+    const int wr = int(PR[3]);   // sliding-window right bound, -1 = open
+    const int do_alibi = int(PR[4]);
     const int DT = D / 8;
 
     threadgroup half Stile [NS][8*BC];
@@ -154,7 +177,10 @@ kernel void flash_attn_fwd_v1(
         for (int r=0; r<8; ++r) {
             const int qrow = q_row0 + r;
             float s = float(Stile[sgid][r*BC + lane]) * scale;
-            const bool valid = (j < Lk) && (!causal || j <= qrow + shift);
+            if (softcap > 0.0f) s = softcap * tanh(s / softcap);
+            if (do_alibi) s -= AL[bh] * float(abs(qrow + shift - j));
+            const bool valid = (j < Lk) && (!causal || j <= qrow + shift)
+                && (wl < 0 || j >= qrow + shift - wl) && (wr < 0 || j <= qrow + shift + wr);
             s = valid ? s : -INFINITY;
             const float mb = simd_max(s);
             const float mn = max(m[r], mb);
@@ -231,7 +257,8 @@ kernel void flash_attn_fwd_v2(
     device half*  V  [[buffer(2)]],   // [B,Hkv,Lk,DD]
     device half*  O  [[buffer(3)]],   // [B,Hq,Lq,DD]
     device int*   SH [[buffer(4)]],   // [B,Hq,Hkv,Lq,Lk,causal]
-    device float* PR [[buffer(5)]],   // [scale]
+    device float* PR [[buffer(5)]],   // [scale, softcap, win_l, win_r, alibi_on]
+    device const float* AL [[buffer(6)]],   // [B*Hq] alibi slopes (read iff alibi_on)
     uint3 tgid [[threadgroup_position_in_grid]],
     uint  tid  [[thread_index_in_threadgroup]],
     uint  sgid [[simdgroup_index_in_threadgroup]],
@@ -239,6 +266,10 @@ kernel void flash_attn_fwd_v2(
 {
     const int Hq=SH[1], Hkv=SH[2], Lq=SH[3], Lk=SH[4], causal=SH[5];
     const float scale = PR[0];
+    const float softcap = PR[1];
+    const int wl = int(PR[2]);   // sliding-window left bound, -1 = open
+    const int wr = int(PR[3]);   // sliding-window right bound, -1 = open
+    const int do_alibi = int(PR[4]);
 
     const int bh  = int(tgid.y);
     const int b   = bh / Hq;
@@ -312,7 +343,10 @@ kernel void flash_attn_fwd_v2(
             const int row  = r0 + r;
             const int qrow = q0 + row;
             float s = tgS[row*BC + lane] * scale;
-            const bool ok = (j < Lk) && (qrow < Lq) && (!causal || j <= qrow + shift);
+            if (softcap > 0.0f) s = softcap * tanh(s / softcap);
+            if (do_alibi) s -= AL[bh] * float(abs(qrow + shift - j));
+            const bool ok = (j < Lk) && (qrow < Lq) && (!causal || j <= qrow + shift)
+                && (wl < 0 || j >= qrow + shift - wl) && (wr < 0 || j <= qrow + shift + wr);
             s = ok ? s : -INFINITY;
             const float mb = simd_max(s);
             const float mn = max(m[r], mb);
@@ -380,13 +414,18 @@ kernel void flash_attn_fwd_v2r(
     device half*  V  [[buffer(2)]],   // [B,Hkv,Lkp,DD] padded to BC multiple
     device half*  O  [[buffer(3)]],   // [B,Hq,Lq,DD]
     device int*   SH [[buffer(4)]],   // [B,Hq,Hkv,Lq,Lk,causal,Lkp]
-    device float* PR [[buffer(5)]],   // [scale]
+    device float* PR [[buffer(5)]],   // [scale, softcap, win_l, win_r, alibi_on]
+    device const float* AL [[buffer(6)]],   // [B*Hq] alibi slopes (read iff alibi_on)
     uint3 tgid [[threadgroup_position_in_grid]],
     uint  sgid [[simdgroup_index_in_threadgroup]],
     uint  lane [[thread_index_in_simdgroup]])
 {
     const int Hq=SH[1], Hkv=SH[2], Lq=SH[3], Lk=SH[4], causal=SH[5], Lkp=SH[6];
     const float scale = PR[0];
+    const float softcap = PR[1];
+    const int wl = int(PR[2]);   // sliding-window left bound, -1 = open
+    const int wr = int(PR[3]);   // sliding-window right bound, -1 = open
+    const int do_alibi = int(PR[4]);
 
     const int bh  = int(tgid.y);
     const int b   = bh / Hq;
@@ -439,8 +478,12 @@ kernel void flash_attn_fwd_v2r(
             auto idx = ctS.get_multidimensional_index(i);
             const int jj = j0 + int(idx[0]);
             const int ii = q0 + int(idx[1]);
-            const bool ok = (jj < Lk) && (ii < Lq) && (!causal || jj <= ii + shift);
-            ctS[i] = ok ? half(float(ctS[i]) * scale) : half(-INFINITY);
+            const bool ok = (jj < Lk) && (ii < Lq) && (!causal || jj <= ii + shift)
+                && (wl < 0 || jj >= ii + shift - wl) && (wr < 0 || jj <= ii + shift + wr);
+            float sv = float(ctS[i]) * scale;
+            if (softcap > 0.0f) sv = softcap * tanh(sv / softcap);
+            if (do_alibi) sv -= AL[bh] * float(abs(ii + shift - jj));
+            ctS[i] = ok ? half(sv) : half(-INFINITY);
         }
 
         // block row-max via reduce_rows (legal at single-simdgroup scope)
@@ -550,6 +593,7 @@ kernel void flash_attn_fwd_v2_dtype(
     device @MSL_T@* O  [[buffer(3)]],
     device int*      SH [[buffer(4)]],
     device float*    PR [[buffer(5)]],
+    device const float* AL [[buffer(6)]],
     uint3 tgid [[threadgroup_position_in_grid]],
     uint  tid  [[thread_index_in_threadgroup]],
     uint  sgid [[simdgroup_index_in_threadgroup]],
@@ -557,6 +601,10 @@ kernel void flash_attn_fwd_v2_dtype(
 {
     const int Hq=SH[1], Hkv=SH[2], Lq=SH[3], Lk=SH[4], causal=SH[5];
     const float scale = PR[0];
+    const float softcap = PR[1];
+    const int wl = int(PR[2]);   // sliding-window left bound, -1 = open
+    const int wr = int(PR[3]);   // sliding-window right bound, -1 = open
+    const int do_alibi = int(PR[4]);
 
     const int bh  = int(tgid.y);
     const int b   = bh / Hq;
@@ -616,7 +664,10 @@ kernel void flash_attn_fwd_v2_dtype(
             const int row  = r0 + r;
             const int qrow = q0 + row;
             float s = tgS[row*BC + lane] * scale;
-            const bool ok = (j < Lk) && (qrow < Lq) && (!causal || j <= qrow + shift);
+            if (softcap > 0.0f) s = softcap * tanh(s / softcap);
+            if (do_alibi) s -= AL[bh] * float(abs(qrow + shift - j));
+            const bool ok = (j < Lk) && (qrow < Lq) && (!causal || j <= qrow + shift)
+                && (wl < 0 || j >= qrow + shift - wl) && (wr < 0 || j <= qrow + shift + wr);
             s = ok ? s : -INFINITY;
             const float mb = simd_max(s);
             const float mn = max(m[r], mb);
@@ -998,7 +1049,8 @@ def _trace_atexit():
         print("\n".join(_trace_summary_lines()), file=sys.stderr, flush=True)
 
 
-def flash_attn_forward(q, k, v, scale, causal):
+def flash_attn_forward(q, k, v, scale, causal, softcap=0.0, window_left=-1, window_right=-1,
+                       alibi_slopes=None):
     """q: [B,Hq,Lq,D], k/v: [B,Hkv,Lk,D] (heads-second, any strides).
 
     Returns [B,Hq,Lq,D] contiguous, in q.dtype.
@@ -1015,9 +1067,16 @@ def flash_attn_forward(q, k, v, scale, causal):
     """
     if _trace_enabled():
         _record_trace(q, k, v, causal)
+    if softcap < 0:
+        # negative softcap is silently ignored by the Metal kernels but applied
+        # by _flash_torch; reject it here so direct callers can't diverge by tier.
+        raise ValueError("metal_flash_attn: softcap must be >= 0 (0 disables capping)")
+    alibi = (_broadcast_alibi_slopes(alibi_slopes, q.shape[0], q.shape[1], q.device)
+             if alibi_slopes is not None else None)
+    bias = _BiasParams(softcap, window_left, window_right, alibi)
     mode = os.environ.get("MTLFLASHATTN_KERNEL", "auto").lower()
     if mode in ("torch", "pytorch"):
-        return _flash_torch(q, k, v, scale, causal)
+        return _flash_torch(q, k, v, scale, causal, bias)
     if mode in ("v2_dtype", "v2_typed"):
         runtime_mode = _v2_mode_for_runtime_dtype(q.dtype)
         if runtime_mode is None or k.dtype != q.dtype or v.dtype != q.dtype:
@@ -1043,8 +1102,8 @@ def flash_attn_forward(q, k, v, scale, causal):
                 "(needs macOS 26+ with MetalPerformancePrimitives)"
             )
         if runtime_mode == "v2":
-            return _flash_v2(q, k, v, scale, causal)
-        return _flash_v2_dtype(q, k, v, scale, causal, runtime_mode)
+            return _flash_v2(q, k, v, scale, causal, bias)
+        return _flash_v2_dtype(q, k, v, scale, causal, bias, runtime_mode)
     dtype_spec = _v2_dtype_spec(mode)
     if dtype_spec is not None:
         dtype = dtype_spec[0]
@@ -1059,7 +1118,7 @@ def flash_attn_forward(q, k, v, scale, causal):
                 f"metal_flash_attn: {mode} kernel forced but TensorOps unavailable "
                 "(needs macOS 26+ with MetalPerformancePrimitives)"
             )
-        return _flash_v2_dtype(q, k, v, scale, causal, mode)
+        return _flash_v2_dtype(q, k, v, scale, causal, bias, mode)
     if mode == "v2":
         if not _v1_eligible(q, k, v):  # same shape/dtype constraints as v1
             raise RuntimeError(
@@ -1071,27 +1130,27 @@ def flash_attn_forward(q, k, v, scale, causal):
                 "metal_flash_attn: v2 kernel forced but TensorOps unavailable "
                 "(needs macOS 26+ with MetalPerformancePrimitives)"
             )
-        return _flash_v2(q, k, v, scale, causal)
+        return _flash_v2(q, k, v, scale, causal, bias)
     if mode == "v1":
         if not _v1_eligible(q, k, v):
             raise RuntimeError(
                 f"metal_flash_attn: v1 kernel forced but ineligible "
                 f"(dtype={q.dtype}, D={q.shape[-1]}; needs fp16, D%8==0, D<={MAX_HEAD_DIM})"
             )
-        return _flash_v1(q, k, v, scale, causal)
+        return _flash_v1(q, k, v, scale, causal, bias)
     if mode == "auto":
         tier = _select_tier(q, k, v)
         if tier == "v2":
-            return _flash_v2(q, k, v, scale, causal)
+            return _flash_v2(q, k, v, scale, causal, bias)
         if tier == "v2_fp32":
-            return _flash_v2_dtype(q, k, v, scale, causal, "v2_fp32")
+            return _flash_v2_dtype(q, k, v, scale, causal, bias, "v2_fp32")
         if tier == "v2_bf16":
-            return _flash_v2_dtype(q, k, v, scale, causal, "v2_bf16")
+            return _flash_v2_dtype(q, k, v, scale, causal, bias, "v2_bf16")
         if tier == "v1":
-            return _flash_v1(q, k, v, scale, causal)
+            return _flash_v1(q, k, v, scale, causal, bias)
         if tier == "torch":
-            return _flash_torch(q, k, v, scale, causal)
-    return _flash_v0(q, k, v, scale, causal)
+            return _flash_torch(q, k, v, scale, causal, bias)
+    return _flash_v0(q, k, v, scale, causal, bias)
 
 
 def _torch_chunk_size():
@@ -1103,7 +1162,7 @@ def _torch_chunk_size():
     return max(1, chunk)
 
 
-def _flash_torch(q, k, v, scale, causal):
+def _flash_torch(q, k, v, scale, causal, bias):
     """Chunked PyTorch matmul-softmax-matmul fallback. Computes in fp32."""
     B, Hq, Lq, D = q.shape
     Hkv, Lk = k.shape[1], k.shape[2]
@@ -1121,15 +1180,28 @@ def _flash_torch(q, k, v, scale, causal):
     kt = kf.transpose(-1, -2)
     out = torch.empty(B, Hq, Lq, D, device=q.device, dtype=torch.float32)
     chunk = _torch_chunk_size()
+    softcap, wl, wr, alibi = bias
+    windowed = wl >= 0 or wr >= 0
     key_pos = None
-    if causal:
+    if causal or windowed:
         key_pos = torch.arange(Lk, device=q.device)[None, :]
     for start in range(0, Lq, chunk):
         end = min(start + chunk, Lq)
         scores = (qf[:, :, start:end] @ kt) * scale
-        if causal:
-            query_pos = torch.arange(start, end, device=q.device)[:, None]
-            scores = scores.masked_fill(key_pos > query_pos + (Lk - Lq), float("-inf"))
+        if softcap:
+            scores = softcap * torch.tanh(scores / softcap)
+        if alibi is not None:
+            center_a = torch.arange(start, end, device=q.device)[:, None] + (Lk - Lq)
+            key_a = torch.arange(Lk, device=q.device)[None, :]
+            scores = scores - alibi.reshape(B, Hq, 1, 1) * (center_a - key_a).abs().float()
+        if causal or windowed:
+            center = torch.arange(start, end, device=q.device)[:, None] + (Lk - Lq)
+            if causal:
+                scores = scores.masked_fill(key_pos > center, float("-inf"))
+            if wl >= 0:
+                scores = scores.masked_fill(key_pos < center - wl, float("-inf"))
+            if wr >= 0:
+                scores = scores.masked_fill(key_pos > center + wr, float("-inf"))
         probs = torch.softmax(scores, dim=-1)
         probs = torch.nan_to_num(probs, nan=0.0)
         out[:, :, start:end] = probs @ vf
@@ -1156,17 +1228,64 @@ def _sh_tensor(values, device):
     return t
 
 
-def _pr_tensor(scale, device):
-    """Cached read-only fp32 scale tensor for kernel dispatch (see note above)."""
-    key = (float(scale), str(device))
+def _pr_tensor(scale, softcap, window_left, window_right, alibi_on, device):
+    """Cached read-only fp32 [scale, softcap, win_left, win_right, alibi_on] tensor.
+
+    softcap=0 disables logit soft-capping; kernels apply
+    s = softcap * tanh(s / softcap) to the scaled scores when softcap > 0.
+    window_left/window_right are sliding-window key bounds relative to the
+    bottom-right-aligned diagonal (center = qpos + (Lk - Lq)); -1 means
+    unbounded on that side. alibi_on (0/1) gates the per-head ALiBi bias
+    s -= slope * |center - keypos| (slopes come from the AL buffer). Stored as
+    fp32 and read back with int() in-shader (exact below 2**24).
+    """
+    key = (float(scale), float(softcap), int(window_left), int(window_right),
+           float(alibi_on), str(device))
     t = _pr_cache.get(key)
     if t is None:
-        t = torch.tensor([float(scale)], dtype=torch.float32, device=device)
+        t = torch.tensor(
+            [float(scale), float(softcap), float(window_left), float(window_right),
+             float(alibi_on)],
+            dtype=torch.float32, device=device,
+        )
         _pr_cache[key] = t
     return t
 
 
-def _flash_v2r_dtype(q, k, v, scale, causal, et):
+_alibi_zero_cache = {}
+
+
+def _alibi_zero(device):
+    """Cached 1-element zero buffer bound to AL when ALiBi is off (never read)."""
+    t = _alibi_zero_cache.get(str(device))
+    if t is None:
+        t = torch.zeros(1, dtype=torch.float32, device=device)
+        _alibi_zero_cache[str(device)] = t
+    return t
+
+
+def _alibi_inputs(alibi, device):
+    """Return (AL buffer, alibi_on flag). `alibi` is a [B*Hq] fp32 slope tensor
+    (already broadcast) or None."""
+    if alibi is None:
+        return _alibi_zero(device), 0.0
+    return alibi, 1.0
+
+
+def _broadcast_alibi_slopes(alibi_slopes, B, Hq, device):
+    """Flatten alibi slopes [Hq] or [B, Hq] to a contiguous [B*Hq] fp32 buffer."""
+    s = alibi_slopes.to(device=device, dtype=torch.float32)
+    if s.dim() == 1 and s.shape[0] == Hq:
+        s = s.unsqueeze(0).expand(B, Hq)
+    elif not (s.dim() == 2 and tuple(s.shape) == (B, Hq)):
+        raise ValueError(
+            f"metal_flash_attn: alibi_slopes must be [Hq={Hq}] or [B={B}, Hq={Hq}], "
+            f"got {tuple(s.shape)}"
+        )
+    return s.reshape(-1).contiguous()
+
+
+def _flash_v2r_dtype(q, k, v, scale, causal, bias, et):
     """Register-resident-P v2r kernel in element type `et` (bf16). Mirrors the
     fp16 v2r dispatch: static-k PV reads full BC-row tiles, so pad K/V to a BC
     multiple. ~2.5x over the threadgroup-round-trip dtype kernel at D<=64."""
@@ -1178,7 +1297,8 @@ def _flash_v2r_dtype(q, k, v, scale, causal, et):
     kc = k.contiguous()
     vc = v.contiguous()
     out = torch.empty(B, Hq, Lq, D, device=q.device, dtype=q.dtype)
-    pr = _pr_tensor(scale, q.device)
+    al, alibi_on = _alibi_inputs(bias.alibi, q.device)
+    pr = _pr_tensor(scale, bias.softcap, bias.window_left, bias.window_right, alibi_on, q.device)
     Lkp = -(-Lk // 32) * 32
     if Lkp != Lk:
         kc = F.pad(kc, (0, 0, 0, Lkp - Lk))
@@ -1187,13 +1307,13 @@ def _flash_v2r_dtype(q, k, v, scale, causal, et):
     rows_per_tg = _v2r_sr(D) * 4
     ntg_x = -(-Lq // rows_per_tg)
     _get_v2r_dtype_lib(D, et).flash_attn_fwd_v2r_dtype(
-        qc, kc, vc, out, sh, pr,
+        qc, kc, vc, out, sh, pr, al,
         threads=(ntg_x * 128, B * Hq, 1), group_size=(128, 1, 1),
     )
     return out
 
 
-def _flash_v2_dtype(q, k, v, scale, causal, mode):
+def _flash_v2_dtype(q, k, v, scale, causal, bias, mode):
     """Experimental TensorOps v2 dtype specialization. No auto promotion yet."""
     B, Hq, Lq, D = q.shape
     Hkv, Lk = k.shape[1], k.shape[2]
@@ -1202,22 +1322,23 @@ def _flash_v2_dtype(q, k, v, scale, causal, mode):
     # D=128. _v2r_dtype_ok encodes the per-dtype D ceiling (bf16: all eligible D,
     # fp32: D<=64).
     if mode in ("v2_bf16", "v2_fp32") and _v2r_dtype_ok(D, Lk, mode):
-        return _flash_v2r_dtype(q, k, v, scale, causal, _v2_dtype_spec(mode)[1])
+        return _flash_v2r_dtype(q, k, v, scale, causal, bias, _v2_dtype_spec(mode)[1])
     qc = q.contiguous()
     kc = k.contiguous()
     vc = v.contiguous()
     out = torch.empty(B, Hq, Lq, D, device=q.device, dtype=q.dtype)
     sh = _sh_tensor([B, Hq, Hkv, Lq, Lk, 1 if causal else 0], q.device)
-    pr = _pr_tensor(scale, q.device)
+    al, alibi_on = _alibi_inputs(bias.alibi, q.device)
+    pr = _pr_tensor(scale, bias.softcap, bias.window_left, bias.window_right, alibi_on, q.device)
     ntg_x = -(-Lq // 32)
     _get_v2_dtype_lib(D, mode).flash_attn_fwd_v2_dtype(
-        qc, kc, vc, out, sh, pr,
+        qc, kc, vc, out, sh, pr, al,
         threads=(ntg_x * 128, B * Hq, 1), group_size=(128, 1, 1),
     )
     return out
 
 
-def _flash_v2(q, k, v, scale, causal):
+def _flash_v2(q, k, v, scale, causal, bias):
     """TensorOps matmul2d FA kernel. fp16 in/out, fp32 cooperative accumulation."""
     import torch.nn.functional as F
 
@@ -1227,7 +1348,8 @@ def _flash_v2(q, k, v, scale, causal):
     kc = k.contiguous()
     vc = v.contiguous()
     out = torch.empty(B, Hq, Lq, D, device=q.device, dtype=torch.float16)
-    pr = _pr_tensor(scale, q.device)
+    al, alibi_on = _alibi_inputs(bias.alibi, q.device)
+    pr = _pr_tensor(scale, bias.softcap, bias.window_left, bias.window_right, alibi_on, q.device)
     lib = _get_v2_lib(D)
     if _v2_reuse_ok(D):
         # v2r: static-k PV reads full BC-row tiles — pad K/V to a BC multiple
@@ -1239,20 +1361,20 @@ def _flash_v2(q, k, v, scale, causal):
         rows_per_tg = _v2r_sr(D) * 4  # 4 simdgroups x SR rows
         ntg_x = -(-Lq // rows_per_tg)
         lib.flash_attn_fwd_v2r(
-            qc, kc, vc, out, sh, pr,
+            qc, kc, vc, out, sh, pr, al,
             threads=(ntg_x * 128, B * Hq, 1), group_size=(128, 1, 1),
         )
         return out
     sh = _sh_tensor([B, Hq, Hkv, Lq, Lk, 1 if causal else 0], q.device)
     ntg_x = -(-Lq // 32)  # BR=32 query rows per threadgroup
     lib.flash_attn_fwd_v2(
-        qc, kc, vc, out, sh, pr,
+        qc, kc, vc, out, sh, pr, al,
         threads=(ntg_x * 128, B * Hq, 1), group_size=(128, 1, 1),
     )
     return out
 
 
-def _flash_v1(q, k, v, scale, causal):
+def _flash_v1(q, k, v, scale, causal, bias):
     """simdgroup_matrix FA-2 kernel. fp16 in/out, fp32 softmax state."""
     import torch.nn.functional as F
 
@@ -1270,16 +1392,17 @@ def _flash_v1(q, k, v, scale, causal):
         vc = F.pad(vc, (0, 0, 0, Lkp - Lk))
     out = torch.empty(B, Hq, Lq, D, device=q.device, dtype=torch.float16)
     sh = _sh_tensor([B, Hq, Hkv, Lq, Lk, Lqp, Lkp, D, 1 if causal else 0], q.device)
-    pr = _pr_tensor(scale, q.device)
+    al, alibi_on = _alibi_inputs(bias.alibi, q.device)
+    pr = _pr_tensor(scale, bias.softcap, bias.window_left, bias.window_right, alibi_on, q.device)
     ntg_x = -(-Lqp // 32)  # 32 query rows per threadgroup (4 simdgroups x 8)
     _get_lib().flash_attn_fwd_v1(
-        qc, kc, vc, out, sh, pr,
+        qc, kc, vc, out, sh, pr, al,
         threads=(ntg_x * 128, B * Hq, 1), group_size=(128, 1, 1),
     )
     return out
 
 
-def _flash_v0(q, k, v, scale, causal):
+def _flash_v0(q, k, v, scale, causal, bias):
     """One thread per query row, fp32 scalar online softmax. Memory-safe baseline."""
     B, Hq, Lq, D = q.shape
     Hkv, Lk = k.shape[1], k.shape[2]
@@ -1288,9 +1411,10 @@ def _flash_v0(q, k, v, scale, causal):
     vf = v.float().contiguous()
     out = torch.empty(B, Hq, Lq, D, device=q.device, dtype=torch.float32)
     sh = _sh_tensor([B, Hq, Hkv, Lq, Lk, D, 1 if causal else 0], q.device)
-    pr = _pr_tensor(scale, q.device)
+    al, alibi_on = _alibi_inputs(bias.alibi, q.device)
+    pr = _pr_tensor(scale, bias.softcap, bias.window_left, bias.window_right, alibi_on, q.device)
     _get_lib().flash_attn_fwd(
-        qf, kf, vf, out, sh, pr,
+        qf, kf, vf, out, sh, pr, al,
         threads=(Lq, B * Hq, 1), group_size=(64, 1, 1),
     )
     return out.to(q.dtype)

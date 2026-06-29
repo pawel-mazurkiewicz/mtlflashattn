@@ -1,7 +1,5 @@
 """MTLFLASHATTN_TRACE: aggregate per-shape/kernel call accounting for diagnosing
 which tier each stage of a real workload actually hits."""
-import math
-
 import pytest
 import torch
 

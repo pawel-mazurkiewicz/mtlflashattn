@@ -31,12 +31,19 @@ def _check_supported(
 ):
     if dropout_p:
         raise NotImplementedError("metal_flash_attn: dropout_p > 0 not supported (inference-only)")
-    if tuple(window_size) != (-1, -1):
-        raise NotImplementedError("metal_flash_attn: sliding window_size not supported yet")
-    if softcap:
-        raise NotImplementedError("metal_flash_attn: softcap not supported")
-    if alibi_slopes is not None:
-        raise NotImplementedError("metal_flash_attn: alibi_slopes not supported")
+    if (
+        not isinstance(window_size, (tuple, list))
+        or len(window_size) != 2
+        or any(not isinstance(w, int) or isinstance(w, bool) or w < -1 for w in window_size)
+    ):
+        raise ValueError(
+            "metal_flash_attn: window_size must be a (left, right) pair of ints >= -1 "
+            "(-1 = unbounded on that side)"
+        )
+    if softcap < 0:
+        raise ValueError("metal_flash_attn: softcap must be >= 0 (0 disables capping)")
+    if alibi_slopes is not None and not torch.is_tensor(alibi_slopes):
+        raise TypeError("metal_flash_attn: alibi_slopes must be a tensor of per-head slopes")
     if deterministic:
         raise NotImplementedError("metal_flash_attn: deterministic not supported")
     if return_attn_probs:
@@ -85,7 +92,9 @@ def flash_attn_func(
     scale = softmax_scale if softmax_scale is not None else 1.0 / math.sqrt(q.shape[-1])
     out = flash_attn_forward(
         q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
-        scale=scale, causal=causal,
+        scale=scale, causal=causal, softcap=softcap,
+        window_left=window_size[0], window_right=window_size[1],
+        alibi_slopes=alibi_slopes,
     )
     return out.transpose(1, 2).contiguous()
 
@@ -146,15 +155,29 @@ def flash_attn_varlen_func(
 
     scale = softmax_scale if softmax_scale is not None else 1.0 / math.sqrt(q.shape[-1])
     out = torch.empty_like(q)
-    for i in range(len(cu_q) - 1):
+    batch = len(cu_q) - 1
+    if (alibi_slopes is not None and alibi_slopes.dim() == 2
+            and tuple(alibi_slopes.shape) != (batch, Hq)):
+        raise ValueError(
+            f"metal_flash_attn: alibi_slopes must be [Hq={Hq}] or [B={batch}, Hq={Hq}], "
+            f"got {tuple(alibi_slopes.shape)}"
+        )
+    for i in range(batch):
         qs = q[cu_q[i]:cu_q[i + 1]]
         ks = k[cu_k[i]:cu_k[i + 1]]
         vs = v[cu_k[i]:cu_k[i + 1]]
         if qs.shape[0] == 0:
             continue
+        # each per-sequence dispatch is B=1; pick this row's slopes from a
+        # batched [batch, Hq] tensor, else pass per-head [Hq] slopes as-is.
+        seq_alibi = alibi_slopes
+        if alibi_slopes is not None and alibi_slopes.dim() == 2:
+            seq_alibi = alibi_slopes[i]
         o = flash_attn_forward(
             qs.permute(1, 0, 2)[None], ks.permute(1, 0, 2)[None],
-            vs.permute(1, 0, 2)[None], scale=scale, causal=causal,
+            vs.permute(1, 0, 2)[None], scale=scale, causal=causal, softcap=softcap,
+            window_left=window_size[0], window_right=window_size[1],
+            alibi_slopes=seq_alibi,
         )  # [1, Hq, Lq_i, D]
         out[cu_q[i]:cu_q[i + 1]] = o[0].permute(1, 0, 2)
     return out
