@@ -60,8 +60,9 @@ out = flash_attn_func(q, k, v, causal=True)
 Exposes the CUDA flash-attn surface: `flash_attn_func`, `flash_attn_varlen_func`,
 `flash_attn_qkvpacked_func`, `flash_attn_kvpacked_func`, `flash_attn_varlen_qkvpacked_func`,
 `flash_attn_varlen_kvpacked_func`, and the `flash_attn.flash_attn_interface` submodule.
-Logit soft-capping (`softcap=`) is supported on all kernel tiers. Unsupported features (dropout,
-alibi, `return_attn_probs`, sliding window, D>128, backward) **raise `NotImplementedError`** so
+Logit soft-capping (`softcap=`) and sliding-window attention (`window_size=`) are supported on
+all kernel tiers. Unsupported features (dropout, alibi, `return_attn_probs`, D>128, backward)
+**raise `NotImplementedError`** so
 callers fall back rather than get wrong results.
 
 ### 2. Direct API
@@ -158,10 +159,11 @@ Reproduce: `python bench/bench_attn.py` (fp16) and `python dev/bench_dtype_kerne
 ## Scope
 
 Inference forward pass only (no backward). Supports `softmax_scale`, bottom-right `causal`,
-GQA/MQA, fp16/bf16/fp32, D≤128, and logit soft-capping (`softcap`). The SDPA patch additionally
+GQA/MQA, fp16/bf16/fp32, D≤128, logit soft-capping (`softcap`), and sliding-window attention
+(`window_size`). The SDPA patch additionally
 carries a defensive exact path for the uneven-V case (value head_dim ≠ query/key head_dim) that
-some MPS versions mishandle. Sliding window, dropout, alibi, KV-cache decode, and FlexAttention
-are not implemented (the shim raises so callers fall back).
+some MPS versions mishandle. Dropout, alibi, KV-cache decode, and FlexAttention are not
+implemented (the shim raises so callers fall back).
 
 ## How it works / engineering notes
 

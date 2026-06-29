@@ -9,7 +9,7 @@ mps_only = pytest.mark.skipif(
 )
 
 
-def ref_attention(q, k, v, causal=False, scale=None, softcap=0.0):
+def ref_attention(q, k, v, causal=False, scale=None, softcap=0.0, window_size=(-1, -1)):
     """Naive reference. q: [B,Hq,Lq,D], k/v: [B,Hkv,Lk,D] (heads-second). fp32.
 
     Causal is bottom-right aligned: query i attends key j iff j <= i + (Lk - Lq),
@@ -25,10 +25,17 @@ def ref_attention(q, k, v, causal=False, scale=None, softcap=0.0):
     s = (q.float() @ k.float().transpose(-1, -2)) * scale
     if softcap:
         s = softcap * torch.tanh(s / softcap)
-    if causal:
+    wl, wr = window_size
+    if causal or wl >= 0 or wr >= 0:
         i = torch.arange(Lq, device=q.device)[:, None]
         j = torch.arange(Lk, device=q.device)[None, :]
-        s = s.masked_fill(j > i + (Lk - Lq), float("-inf"))
+        center = i + (Lk - Lq)
+        if causal:
+            s = s.masked_fill(j > center, float("-inf"))
+        if wl >= 0:
+            s = s.masked_fill(j < center - wl, float("-inf"))
+        if wr >= 0:
+            s = s.masked_fill(j > center + wr, float("-inf"))
     p = torch.softmax(s, dim=-1)
     # fully-masked rows (Lq > Lk corner) produce nan; flash-attn outputs 0 there
     p = torch.nan_to_num(p, nan=0.0)
@@ -52,15 +59,17 @@ TOL = {
 }
 
 
-def check(q, k, v, causal=False, scale=None, softcap=0.0, **tol_override):
+def check(q, k, v, causal=False, scale=None, softcap=0.0, window_size=(-1, -1), **tol_override):
     from metal_flash_attn import flash_attn_func
 
-    out = flash_attn_func(q, k, v, softmax_scale=scale, causal=causal, softcap=softcap)
+    out = flash_attn_func(
+        q, k, v, softmax_scale=scale, causal=causal, softcap=softcap, window_size=window_size
+    )
     assert out.shape == q.shape
     assert out.dtype == q.dtype
     ref = ref_attention(
         q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
-        causal=causal, scale=scale, softcap=softcap,
+        causal=causal, scale=scale, softcap=softcap, window_size=window_size,
     ).transpose(1, 2)
     tol = {**TOL[q.dtype], **tol_override}
     torch.testing.assert_close(out.float(), ref, **tol)
@@ -115,12 +124,11 @@ class TestFlashAttnFunc:
         "kwargs",
         [
             dict(dropout_p=0.1),
-            dict(window_size=(64, 0)),
             dict(alibi_slopes=torch.ones(4, device="mps")),
             dict(deterministic=True),
             dict(return_attn_probs=True),
         ],
-        ids=["dropout", "window", "alibi", "deterministic", "probs"],
+        ids=["dropout", "alibi", "deterministic", "probs"],
     )
     def test_unsupported_kwargs_raise(self, kwargs):
         q, k, v = make_qkv(1, 32, 32, 4, 4, 64, torch.float16)
@@ -186,5 +194,78 @@ class TestSoftcap:
         out = flash_attn_func(q, k, v, softcap=5.0)
         ref = ref_attention(
             q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), softcap=5.0,
+        ).transpose(1, 2)
+        torch.testing.assert_close(out.float(), ref, **TOL[dtype])
+
+
+@mps_only
+class TestSlidingWindow:
+    """Sliding-window attention: key j is valid for query i iff
+    j in [center - left, center + right], center = i + (Lk - Lq); -1 = unbounded.
+    Honored by the auto path and every forced kernel tier."""
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+    def test_matches_reference(self, dtype):
+        q, k, v = make_qkv(2, 256, 256, 4, 4, 64, dtype)
+        check(q, k, v, window_size=(48, 0))
+
+    def test_symmetric_window(self):
+        q, k, v = make_qkv(1, 128, 128, 2, 2, 64, torch.float32)
+        check(q, k, v, window_size=(16, 16))
+
+    def test_causal_plus_window(self):
+        # Mistral-style: causal cap + bounded left context
+        q, k, v = make_qkv(1, 200, 200, 2, 2, 64, torch.float32)
+        check(q, k, v, causal=True, window_size=(32, -1))
+
+    def test_cross_length_window(self):
+        q, k, v = make_qkv(1, 64, 192, 2, 2, 64, torch.float32)
+        check(q, k, v, window_size=(40, 8))
+
+    def test_window_changes_output(self):
+        from metal_flash_attn import flash_attn_func
+
+        q, k, v = make_qkv(1, 128, 128, 2, 2, 64, torch.float32)
+        narrow = flash_attn_func(q, k, v, window_size=(8, 0))
+        full = flash_attn_func(q, k, v)
+        assert not torch.allclose(narrow.float(), full.float(), atol=1e-3)
+
+    def test_window_wider_than_seq_is_full(self):
+        # a window spanning the whole sequence == unmasked attention
+        q, k, v = make_qkv(1, 64, 64, 2, 2, 64, torch.float32)
+        check(q, k, v, window_size=(1000, 1000))
+
+    def test_bad_window_raises(self):
+        from metal_flash_attn import flash_attn_func
+
+        q, k, v = make_qkv(1, 32, 32, 2, 2, 64, torch.float16)
+        with pytest.raises(ValueError):
+            flash_attn_func(q, k, v, window_size=(-2, 0))
+
+    @pytest.mark.parametrize(
+        "kernel,dtype,d",
+        [
+            ("torch", torch.float32, 64),
+            ("v0", torch.float32, 64),
+            ("v1", torch.float16, 64),
+            ("v2", torch.float16, 64),
+            ("v2", torch.float16, 128),
+            ("v2_fp32", torch.float32, 64),
+            ("v2_fp32", torch.float32, 128),
+            ("v2_bf16", torch.bfloat16, 64),
+            ("v2_bf16", torch.bfloat16, 128),
+        ],
+    )
+    def test_per_tier_honors_window(self, monkeypatch, kernel, dtype, d):
+        from metal_flash_attn import _kernel, flash_attn_func
+
+        if kernel in ("v2", "v2_fp32", "v2_bf16") and not _kernel._v2_supported():
+            pytest.skip("TensorOps v2 unavailable")
+        monkeypatch.setenv("MTLFLASHATTN_KERNEL", kernel)
+        q, k, v = make_qkv(1, 256, 256, 2, 2, d, dtype)
+        win = (64, 16)
+        out = flash_attn_func(q, k, v, window_size=win)
+        ref = ref_attention(
+            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), window_size=win,
         ).transpose(1, 2)
         torch.testing.assert_close(out.float(), ref, **TOL[dtype])

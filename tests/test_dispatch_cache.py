@@ -19,13 +19,15 @@ pytestmark = pytest.mark.skipif(
 
 def test_pr_tensor_cached_and_correct():
     dev = torch.device("mps")
-    t1 = _kernel._pr_tensor(0.1, 0.0, dev)
-    t2 = _kernel._pr_tensor(0.1, 0.0, dev)
-    assert t1 is t2, "same scale+softcap+device must reuse the cached tensor"
-    assert t1.dtype == torch.float32 and t1.shape == (2,)
+    t1 = _kernel._pr_tensor(0.1, 0.0, -1, -1, dev)
+    t2 = _kernel._pr_tensor(0.1, 0.0, -1, -1, dev)
+    assert t1 is t2, "same scale+softcap+window+device must reuse the cached tensor"
+    assert t1.dtype == torch.float32 and t1.shape == (4,)
     assert abs(float(t1[0].item()) - 0.1) < 1e-6 and float(t1[1].item()) == 0.0
-    assert _kernel._pr_tensor(0.2, 0.0, dev) is not t1, "different scale -> different tensor"
-    assert _kernel._pr_tensor(0.1, 30.0, dev) is not t1, "different softcap -> different tensor"
+    assert t1[2].item() == -1.0 and t1[3].item() == -1.0
+    assert _kernel._pr_tensor(0.2, 0.0, -1, -1, dev) is not t1, "different scale -> different tensor"
+    assert _kernel._pr_tensor(0.1, 30.0, -1, -1, dev) is not t1, "different softcap -> different tensor"
+    assert _kernel._pr_tensor(0.1, 0.0, 64, 0, dev) is not t1, "different window -> different tensor"
 
 
 def test_sh_tensor_cached_and_correct():
@@ -51,11 +53,11 @@ def test_v2_dtype_dispatch_uses_cache_and_matches_reference():
     k = torch.randn(1, Hq, Lk, D, device="mps", dtype=torch.bfloat16)
     v = torch.randn(1, Hq, Lk, D, device="mps", dtype=torch.bfloat16)
     scale = 1.0 / math.sqrt(D)
-    o1 = _kernel._flash_v2_dtype(q, k, v, scale, False, 0.0, "v2_bf16")
+    o1 = _kernel._flash_v2_dtype(q, k, v, scale, False, 0.0, -1, -1, "v2_bf16")
     n_sh = len(_kernel._sh_cache)
     n_pr = len(_kernel._pr_cache)
     assert n_sh >= 1 and n_pr >= 1, "dispatch must populate the caches"
-    o2 = _kernel._flash_v2_dtype(q, k, v, scale, False, 0.0, "v2_bf16")
+    o2 = _kernel._flash_v2_dtype(q, k, v, scale, False, 0.0, -1, -1, "v2_bf16")
     # identical shape/scale -> no new cache entries allocated
     assert len(_kernel._sh_cache) == n_sh
     assert len(_kernel._pr_cache) == n_pr
