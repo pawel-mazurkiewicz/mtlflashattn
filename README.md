@@ -84,6 +84,14 @@ Fires on three gates: **correctness** (`max(Lq,Lk) ≥ MTLFLASHATTN_SDPA_MIN_SEQ
 **memory** (`MTLFLASHATTN_SDPA_MIN_GB`, default 12). Tiny attention stays on stock. Never
 crashes the caller — any kernel error falls through to the original op.
 
+Independently of those gates, a **defensive uneven-V shield** computes attention directly
+(chunked fp32, query-tiled) whenever value's head_dim differs from query/key's. Some torch/macOS
+versions have been observed to mishandle this wide-value case in stock MPS SDPA (notably with
+Hunyuan3D's PBR reference attention, where per-material value projections are concatenated);
+current torch (2.12) / macOS 27 handles it correctly, so this is cheap insurance rather than a
+fix for a reproducing bug. This path matches torch SDPA semantics, including **top-left**
+`causal` alignment (vs the kernel's bottom-right convention).
+
 ## Kernel tiers
 
 Selected automatically by dtype, head dim, and sequence length (`MTLFLASHATTN_KERNEL=auto`):
@@ -149,8 +157,11 @@ Reproduce: `python bench/bench_attn.py` (fp16) and `python dev/bench_dtype_kerne
 ## Scope
 
 Inference forward pass only (no backward). Supports `softmax_scale`, bottom-right `causal`,
-GQA/MQA, fp16/bf16/fp32, D≤128. Sliding window, dropout, alibi, softcap, KV-cache decode, and
-FlexAttention are not implemented (the shim raises so callers fall back).
+GQA/MQA, fp16/bf16/fp32, D≤128. The SDPA patch additionally carries a defensive exact path for
+the uneven-V case (value head_dim ≠ query/key head_dim) that some MPS versions mishandle.
+Sliding window, dropout,
+alibi, softcap, KV-cache decode, and FlexAttention are not implemented (the shim raises so
+callers fall back).
 
 ## How it works / engineering notes
 

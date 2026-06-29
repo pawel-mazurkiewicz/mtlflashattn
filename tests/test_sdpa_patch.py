@@ -29,6 +29,15 @@ def make_bhld(B, H, Lq, Lk, D, dtype=torch.float16, Hkv=None, seed=0):
     return q, k, v
 
 
+def make_uneven_v(B, H, Lq, Lk, Dqk, Dv, dtype=torch.float16, Hkv=None, seed=0):
+    """q/k have head_dim Dqk; v has a wider head_dim Dv."""
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    q = torch.randn(B, H, Lq, Dqk, generator=g).to("mps", dtype)
+    k = torch.randn(B, Hkv or H, Lk, Dqk, generator=g).to("mps", dtype)
+    v = torch.randn(B, Hkv or H, Lk, Dv, generator=g).to("mps", dtype)
+    return q, k, v
+
+
 @mps_only
 class TestSdpaPatch:
     def test_install_uninstall_restores_original(self):
@@ -183,3 +192,58 @@ class TestSdpaGate:
         finally:
             sdpa.uninstall()
         assert ok and reason == "correctness-large-seq", reason
+
+
+@mps_only
+class TestSdpaUnevenV:
+    """value head_dim != query/key head_dim. Some torch/macOS versions have
+    mishandled this wide-value case in stock MPS SDPA; the patch carries a
+    defensive chunked-fp32 path (independent of the routing gates). These assert
+    that path stays exact — current torch handles uneven-V correctly too."""
+
+    def test_uneven_v_shape_and_values(self, sdpa_patch):
+        q, k, v = make_uneven_v(1, 4, 128, 128, 64, 128, dtype=torch.float32)
+        out = F.scaled_dot_product_attention(q, k, v)
+        assert out.shape == (1, 4, 128, 128)  # Dv, not Dqk
+        torch.testing.assert_close(out, ref_attention(q, k, v), **TOL[torch.float32])
+
+    def test_uneven_v_gqa(self, sdpa_patch):
+        q, k, v = make_uneven_v(1, 8, 96, 96, 64, 128, dtype=torch.float32, Hkv=2)
+        out = F.scaled_dot_product_attention(q, k, v, enable_gqa=True)
+        torch.testing.assert_close(out, ref_attention(q, k, v), **TOL[torch.float32])
+
+    def test_uneven_v_causal_top_left(self, sdpa_patch):
+        # Lq == Lk, so the shield's top-left causal == ref_attention's bottom-right
+        q, k, v = make_uneven_v(1, 2, 96, 96, 64, 128, dtype=torch.float32)
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        torch.testing.assert_close(out, ref_attention(q, k, v, causal=True),
+                                   **TOL[torch.float32])
+
+    def test_uneven_v_additive_mask(self, sdpa_patch):
+        q, k, v = make_uneven_v(1, 2, 64, 80, 64, 128, dtype=torch.float32)
+        mask = torch.randn(1, 2, 64, 80, device="mps", dtype=torch.float32)
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+        s = (q.float() @ k.float().transpose(-1, -2)) / (64 ** 0.5) + mask.float()
+        ref = torch.softmax(s, dim=-1) @ v.float()
+        torch.testing.assert_close(out, ref, **TOL[torch.float32])
+
+    def test_uneven_v_chunked(self, sdpa_patch):
+        # Lq spans several q_chunk (4096) windows
+        q, k, v = make_uneven_v(1, 1, 5000, 256, 64, 128, dtype=torch.float32)
+        out = F.scaled_dot_product_attention(q, k, v)
+        torch.testing.assert_close(out, ref_attention(q, k, v), **TOL[torch.float32])
+
+    def test_uneven_v_shielded_under_default_gates(self):
+        # The shield is independent of the routing gates: even at the default 12 GB
+        # threshold (this shape is tiny and would otherwise stay on stock), uneven-V
+        # takes the defensive path and stays exact, Dv-shaped.
+        from metal_flash_attn import sdpa
+
+        q, k, v = make_uneven_v(1, 2, 64, 64, 64, 128, dtype=torch.float32)
+        assert sdpa.install()  # default threshold
+        try:
+            out = F.scaled_dot_product_attention(q, k, v)
+        finally:
+            sdpa.uninstall()
+        assert out.shape == (1, 2, 64, 128)
+        torch.testing.assert_close(out, ref_attention(q, k, v), **TOL[torch.float32])
