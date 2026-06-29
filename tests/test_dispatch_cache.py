@@ -54,11 +54,11 @@ def test_v2_dtype_dispatch_uses_cache_and_matches_reference():
     k = torch.randn(1, Hq, Lk, D, device="mps", dtype=torch.bfloat16)
     v = torch.randn(1, Hq, Lk, D, device="mps", dtype=torch.bfloat16)
     scale = 1.0 / math.sqrt(D)
-    o1 = _kernel._flash_v2_dtype(q, k, v, scale, False, 0.0, -1, -1, "v2_bf16", None)
+    o1 = _kernel._flash_v2_dtype(q, k, v, scale, False, _kernel._BiasParams(0.0, -1, -1, None), "v2_bf16")
     n_sh = len(_kernel._sh_cache)
     n_pr = len(_kernel._pr_cache)
     assert n_sh >= 1 and n_pr >= 1, "dispatch must populate the caches"
-    o2 = _kernel._flash_v2_dtype(q, k, v, scale, False, 0.0, -1, -1, "v2_bf16", None)
+    o2 = _kernel._flash_v2_dtype(q, k, v, scale, False, _kernel._BiasParams(0.0, -1, -1, None), "v2_bf16")
     # identical shape/scale -> no new cache entries allocated
     assert len(_kernel._sh_cache) == n_sh
     assert len(_kernel._pr_cache) == n_pr
