@@ -9,7 +9,8 @@ mps_only = pytest.mark.skipif(
 )
 
 
-def ref_attention(q, k, v, causal=False, scale=None, softcap=0.0, window_size=(-1, -1)):
+def ref_attention(q, k, v, causal=False, scale=None, softcap=0.0, window_size=(-1, -1),
+                  alibi_slopes=None):
     """Naive reference. q: [B,Hq,Lq,D], k/v: [B,Hkv,Lk,D] (heads-second). fp32.
 
     Causal is bottom-right aligned: query i attends key j iff j <= i + (Lk - Lq),
@@ -25,6 +26,12 @@ def ref_attention(q, k, v, causal=False, scale=None, softcap=0.0, window_size=(-
     s = (q.float() @ k.float().transpose(-1, -2)) * scale
     if softcap:
         s = softcap * torch.tanh(s / softcap)
+    if alibi_slopes is not None:
+        slopes = alibi_slopes.to(s.device, torch.float32)
+        slopes = slopes.reshape(1, Hq, 1, 1) if slopes.dim() == 1 else slopes.reshape(B, Hq, 1, 1)
+        ii = torch.arange(Lq, device=s.device)[:, None]
+        jj = torch.arange(Lk, device=s.device)[None, :]
+        s = s - slopes * (ii + (Lk - Lq) - jj).abs().float()
     wl, wr = window_size
     if causal or wl >= 0 or wr >= 0:
         i = torch.arange(Lq, device=q.device)[:, None]
@@ -59,17 +66,20 @@ TOL = {
 }
 
 
-def check(q, k, v, causal=False, scale=None, softcap=0.0, window_size=(-1, -1), **tol_override):
+def check(q, k, v, causal=False, scale=None, softcap=0.0, window_size=(-1, -1),
+          alibi_slopes=None, **tol_override):
     from metal_flash_attn import flash_attn_func
 
     out = flash_attn_func(
-        q, k, v, softmax_scale=scale, causal=causal, softcap=softcap, window_size=window_size
+        q, k, v, softmax_scale=scale, causal=causal, softcap=softcap,
+        window_size=window_size, alibi_slopes=alibi_slopes,
     )
     assert out.shape == q.shape
     assert out.dtype == q.dtype
     ref = ref_attention(
         q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
         causal=causal, scale=scale, softcap=softcap, window_size=window_size,
+        alibi_slopes=alibi_slopes,
     ).transpose(1, 2)
     tol = {**TOL[q.dtype], **tol_override}
     torch.testing.assert_close(out.float(), ref, **tol)
@@ -124,11 +134,10 @@ class TestFlashAttnFunc:
         "kwargs",
         [
             dict(dropout_p=0.1),
-            dict(alibi_slopes=torch.ones(4, device="mps")),
             dict(deterministic=True),
             dict(return_attn_probs=True),
         ],
-        ids=["dropout", "alibi", "deterministic", "probs"],
+        ids=["dropout", "deterministic", "probs"],
     )
     def test_unsupported_kwargs_raise(self, kwargs):
         q, k, v = make_qkv(1, 32, 32, 4, 4, 64, torch.float16)
@@ -267,5 +276,83 @@ class TestSlidingWindow:
         out = flash_attn_func(q, k, v, window_size=win)
         ref = ref_attention(
             q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), window_size=win,
+        ).transpose(1, 2)
+        torch.testing.assert_close(out.float(), ref, **TOL[dtype])
+
+
+@mps_only
+class TestAlibi:
+    """ALiBi: per-head linear position bias s -= slope_h * |center - keypos|,
+    center = qpos + (Lk - Lq); matches flash-attn for causal and non-causal.
+    Honored by the auto path and every forced kernel tier."""
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+    def test_matches_reference(self, dtype):
+        q, k, v = make_qkv(2, 128, 128, 4, 4, 64, dtype)
+        slopes = torch.tensor([0.5, 0.25, 0.125, 0.0625], device="mps")
+        check(q, k, v, alibi_slopes=slopes)
+
+    def test_alibi_causal(self):
+        q, k, v = make_qkv(1, 96, 96, 4, 4, 64, torch.float32)
+        slopes = torch.tensor([0.5, 0.25, 0.125, 0.0625], device="mps")
+        check(q, k, v, causal=True, alibi_slopes=slopes)
+
+    def test_alibi_cross_length(self):
+        q, k, v = make_qkv(1, 64, 192, 2, 2, 64, torch.float32)
+        check(q, k, v, alibi_slopes=torch.tensor([0.3, 0.1], device="mps"))
+
+    def test_batched_slopes(self):
+        # alibi_slopes shaped [B, Hq]
+        q, k, v = make_qkv(2, 96, 96, 2, 2, 64, torch.float32)
+        slopes = torch.tensor([[0.5, 0.25], [0.1, 0.05]], device="mps")
+        check(q, k, v, alibi_slopes=slopes)
+
+    def test_alibi_changes_output(self):
+        from metal_flash_attn import flash_attn_func
+
+        q, k, v = make_qkv(1, 128, 128, 2, 2, 64, torch.float32)
+        biased = flash_attn_func(q, k, v, alibi_slopes=torch.tensor([0.5, 0.5], device="mps"))
+        plain = flash_attn_func(q, k, v)
+        assert not torch.allclose(biased.float(), plain.float(), atol=1e-3)
+
+    def test_bad_alibi_shape_raises(self):
+        from metal_flash_attn import flash_attn_func
+
+        q, k, v = make_qkv(1, 32, 32, 4, 4, 64, torch.float16)
+        with pytest.raises(ValueError):
+            flash_attn_func(q, k, v, alibi_slopes=torch.ones(3, device="mps"))  # Hq=4
+
+    def test_alibi_non_tensor_raises(self):
+        from metal_flash_attn import flash_attn_func
+
+        q, k, v = make_qkv(1, 32, 32, 4, 4, 64, torch.float16)
+        with pytest.raises(TypeError):
+            flash_attn_func(q, k, v, alibi_slopes=[0.5, 0.25, 0.125, 0.0625])
+
+    @pytest.mark.parametrize(
+        "kernel,dtype,d",
+        [
+            ("torch", torch.float32, 64),
+            ("v0", torch.float32, 64),
+            ("v1", torch.float16, 64),
+            ("v2", torch.float16, 64),
+            ("v2", torch.float16, 128),
+            ("v2_fp32", torch.float32, 64),
+            ("v2_fp32", torch.float32, 128),
+            ("v2_bf16", torch.bfloat16, 64),
+            ("v2_bf16", torch.bfloat16, 128),
+        ],
+    )
+    def test_per_tier_honors_alibi(self, monkeypatch, kernel, dtype, d):
+        from metal_flash_attn import _kernel, flash_attn_func
+
+        if kernel in ("v2", "v2_fp32", "v2_bf16") and not _kernel._v2_supported():
+            pytest.skip("TensorOps v2 unavailable")
+        monkeypatch.setenv("MTLFLASHATTN_KERNEL", kernel)
+        q, k, v = make_qkv(1, 256, 256, 2, 2, d, dtype)
+        slopes = torch.tensor([0.1, 0.05], device="mps")
+        out = flash_attn_func(q, k, v, alibi_slopes=slopes)
+        ref = ref_attention(
+            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), alibi_slopes=slopes,
         ).transpose(1, 2)
         torch.testing.assert_close(out.float(), ref, **TOL[dtype])

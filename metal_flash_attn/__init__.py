@@ -38,8 +38,8 @@ def _check_supported(
         )
     if softcap < 0:
         raise ValueError("metal_flash_attn: softcap must be >= 0 (0 disables capping)")
-    if alibi_slopes is not None:
-        raise NotImplementedError("metal_flash_attn: alibi_slopes not supported")
+    if alibi_slopes is not None and not torch.is_tensor(alibi_slopes):
+        raise TypeError("metal_flash_attn: alibi_slopes must be a tensor of per-head slopes")
     if deterministic:
         raise NotImplementedError("metal_flash_attn: deterministic not supported")
     if return_attn_probs:
@@ -90,6 +90,7 @@ def flash_attn_func(
         q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
         scale=scale, causal=causal, softcap=softcap,
         window_left=window_size[0], window_right=window_size[1],
+        alibi_slopes=alibi_slopes,
     )
     return out.transpose(1, 2).contiguous()
 
@@ -160,6 +161,7 @@ def flash_attn_varlen_func(
             qs.permute(1, 0, 2)[None], ks.permute(1, 0, 2)[None],
             vs.permute(1, 0, 2)[None], scale=scale, causal=causal, softcap=softcap,
             window_left=window_size[0], window_right=window_size[1],
+            alibi_slopes=alibi_slopes,
         )  # [1, Hq, Lq_i, D]
         out[cu_q[i]:cu_q[i + 1]] = o[0].permute(1, 0, 2)
     return out
