@@ -73,7 +73,8 @@ def _eligibility(q, k, v, attn_mask, dropout_p, is_causal):
     return False, f"fits({score_bytes / 1024**3:.2f}GB)"
 
 
-def _uneven_v_attention(query, key, value, attn_mask, is_causal, scale, q_chunk=4096):
+def _uneven_v_attention(query, key, value, attn_mask, is_causal, scale, enable_gqa=False,
+                        q_chunk=4096):
     """Defensive exact path for value_head_dim != query/key_head_dim.
 
     Some torch/macOS versions have been observed to mishandle the wide-value case
@@ -85,7 +86,16 @@ def _uneven_v_attention(query, key, value, attn_mask, is_causal, scale, q_chunk=
     Lq x Lk score matrix never has to be fully materialized.
     """
     Hq, Hkv = query.shape[1], key.shape[1]
-    if Hkv != 0 and Hq != Hkv and Hq % Hkv == 0:  # GQA / MQA: expand kv heads
+    # Expand kv heads only when the caller opted into GQA — mirroring stock SDPA,
+    # which rejects unequal head counts unless enable_gqa=True. We raise a clean
+    # error here rather than defer to stock: on MPS the unequal-heads case
+    # hard-aborts the process (LLVM ERROR), which would crash the caller.
+    if Hq != Hkv:
+        if not (enable_gqa and Hkv != 0 and Hq % Hkv == 0):
+            raise ValueError(
+                f"metal_flash_attn: SDPA query/kv head mismatch (Hq={Hq}, Hkv={Hkv}); "
+                "pass enable_gqa=True for GQA/MQA"
+            )
         rep = Hq // Hkv
         key = key.repeat_interleave(rep, dim=1)
         value = value.repeat_interleave(rep, dim=1)
@@ -132,7 +142,8 @@ def _sdpa(query, key, value, attn_mask=None, dropout_p=0.0,
     if (query.device.type == "mps" and not dropout_p
             and query.dim() == 4 and value.dim() == 4
             and value.shape[-1] != query.shape[-1]):
-        return _uneven_v_attention(query, key, value, attn_mask, is_causal, scale)
+        return _uneven_v_attention(query, key, value, attn_mask, is_causal, scale,
+                                   enable_gqa=kwargs.get("enable_gqa", False))
     return _orig(query, key, value, attn_mask=attn_mask, dropout_p=dropout_p,
                  is_causal=is_causal, scale=scale, **kwargs)
 

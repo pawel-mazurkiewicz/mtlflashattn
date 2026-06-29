@@ -157,11 +157,16 @@ def flash_attn_varlen_func(
         vs = v[cu_k[i]:cu_k[i + 1]]
         if qs.shape[0] == 0:
             continue
+        # each per-sequence dispatch is B=1; pick this row's slopes from a
+        # batched [batch, Hq] tensor, else pass per-head [Hq] slopes as-is.
+        seq_alibi = alibi_slopes
+        if alibi_slopes is not None and alibi_slopes.dim() == 2:
+            seq_alibi = alibi_slopes[i]
         o = flash_attn_forward(
             qs.permute(1, 0, 2)[None], ks.permute(1, 0, 2)[None],
             vs.permute(1, 0, 2)[None], scale=scale, causal=causal, softcap=softcap,
             window_left=window_size[0], window_right=window_size[1],
-            alibi_slopes=alibi_slopes,
+            alibi_slopes=seq_alibi,
         )  # [1, Hq, Lq_i, D]
         out[cu_q[i]:cu_q[i + 1]] = o[0].permute(1, 0, 2)
     return out

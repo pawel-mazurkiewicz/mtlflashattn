@@ -212,6 +212,13 @@ class TestSdpaUnevenV:
         out = F.scaled_dot_product_attention(q, k, v, enable_gqa=True)
         torch.testing.assert_close(out, ref_attention(q, k, v), **TOL[torch.float32])
 
+    def test_uneven_v_unequal_heads_without_gqa_raises(self, sdpa_patch):
+        # mismatched heads without enable_gqa must NOT silently GQA-expand (and must
+        # not defer to stock, which hard-aborts on MPS) — a clean ValueError instead
+        q, k, v = make_uneven_v(1, 8, 96, 96, 64, 128, dtype=torch.float32, Hkv=2)
+        with pytest.raises(ValueError):
+            F.scaled_dot_product_attention(q, k, v)
+
     def test_uneven_v_causal_top_left(self, sdpa_patch):
         # Lq == Lk, so the shield's top-left causal == ref_attention's bottom-right
         q, k, v = make_uneven_v(1, 2, 96, 96, 64, 128, dtype=torch.float32)
