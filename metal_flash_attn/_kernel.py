@@ -1067,6 +1067,10 @@ def flash_attn_forward(q, k, v, scale, causal, softcap=0.0, window_left=-1, wind
     """
     if _trace_enabled():
         _record_trace(q, k, v, causal)
+    if softcap < 0:
+        # negative softcap is silently ignored by the Metal kernels but applied
+        # by _flash_torch; reject it here so direct callers can't diverge by tier.
+        raise ValueError("metal_flash_attn: softcap must be >= 0 (0 disables capping)")
     alibi = (_broadcast_alibi_slopes(alibi_slopes, q.shape[0], q.shape[1], q.device)
              if alibi_slopes is not None else None)
     bias = _BiasParams(softcap, window_left, window_right, alibi)

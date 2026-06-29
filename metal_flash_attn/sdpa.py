@@ -123,7 +123,10 @@ def _uneven_v_attention(query, key, value, attn_mask, is_causal, scale, enable_g
             qpos = torch.arange(i, i + qi.shape[-2], device=query.device).unsqueeze(-1)
             kpos = torch.arange(Lk, device=query.device).unsqueeze(0)
             scores = scores.masked_fill(kpos > qpos, float("-inf"))
-        outs.append(torch.matmul(scores.softmax(dim=-1), value_f))
+        # fully masked rows (bool mask or additive -inf) make softmax emit NaN;
+        # zero them like ref_attention does, rather than propagating NaN.
+        probs = torch.nan_to_num(scores.softmax(dim=-1), nan=0.0)
+        outs.append(torch.matmul(probs, value_f))
     return torch.cat(outs, dim=-2).to(value.dtype)
 
 

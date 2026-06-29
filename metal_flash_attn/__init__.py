@@ -31,7 +31,11 @@ def _check_supported(
 ):
     if dropout_p:
         raise NotImplementedError("metal_flash_attn: dropout_p > 0 not supported (inference-only)")
-    if len(window_size) != 2 or int(window_size[0]) < -1 or int(window_size[1]) < -1:
+    if (
+        not isinstance(window_size, (tuple, list))
+        or len(window_size) != 2
+        or any(not isinstance(w, int) or isinstance(w, bool) or w < -1 for w in window_size)
+    ):
         raise ValueError(
             "metal_flash_attn: window_size must be a (left, right) pair of ints >= -1 "
             "(-1 = unbounded on that side)"
@@ -151,7 +155,14 @@ def flash_attn_varlen_func(
 
     scale = softmax_scale if softmax_scale is not None else 1.0 / math.sqrt(q.shape[-1])
     out = torch.empty_like(q)
-    for i in range(len(cu_q) - 1):
+    batch = len(cu_q) - 1
+    if (alibi_slopes is not None and alibi_slopes.dim() == 2
+            and tuple(alibi_slopes.shape) != (batch, Hq)):
+        raise ValueError(
+            f"metal_flash_attn: alibi_slopes must be [Hq={Hq}] or [B={batch}, Hq={Hq}], "
+            f"got {tuple(alibi_slopes.shape)}"
+        )
+    for i in range(batch):
         qs = q[cu_q[i]:cu_q[i + 1]]
         ks = k[cu_k[i]:cu_k[i + 1]]
         vs = v[cu_k[i]:cu_k[i + 1]]

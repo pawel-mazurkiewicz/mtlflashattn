@@ -216,7 +216,7 @@ class TestSdpaUnevenV:
         # mismatched heads without enable_gqa must NOT silently GQA-expand (and must
         # not defer to stock, which hard-aborts on MPS) — a clean ValueError instead
         q, k, v = make_uneven_v(1, 8, 96, 96, 64, 128, dtype=torch.float32, Hkv=2)
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="pass enable_gqa=True for GQA/MQA"):
             F.scaled_dot_product_attention(q, k, v)
 
     def test_uneven_v_causal_top_left(self, sdpa_patch):
