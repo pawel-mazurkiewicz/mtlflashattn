@@ -33,8 +33,8 @@ def _check_supported(
         raise NotImplementedError("metal_flash_attn: dropout_p > 0 not supported (inference-only)")
     if tuple(window_size) != (-1, -1):
         raise NotImplementedError("metal_flash_attn: sliding window_size not supported yet")
-    if softcap:
-        raise NotImplementedError("metal_flash_attn: softcap not supported")
+    if softcap < 0:
+        raise ValueError("metal_flash_attn: softcap must be >= 0 (0 disables capping)")
     if alibi_slopes is not None:
         raise NotImplementedError("metal_flash_attn: alibi_slopes not supported")
     if deterministic:
@@ -85,7 +85,7 @@ def flash_attn_func(
     scale = softmax_scale if softmax_scale is not None else 1.0 / math.sqrt(q.shape[-1])
     out = flash_attn_forward(
         q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
-        scale=scale, causal=causal,
+        scale=scale, causal=causal, softcap=softcap,
     )
     return out.transpose(1, 2).contiguous()
 
@@ -154,7 +154,7 @@ def flash_attn_varlen_func(
             continue
         o = flash_attn_forward(
             qs.permute(1, 0, 2)[None], ks.permute(1, 0, 2)[None],
-            vs.permute(1, 0, 2)[None], scale=scale, causal=causal,
+            vs.permute(1, 0, 2)[None], scale=scale, causal=causal, softcap=softcap,
         )  # [1, Hq, Lq_i, D]
         out[cu_q[i]:cu_q[i + 1]] = o[0].permute(1, 0, 2)
     return out
