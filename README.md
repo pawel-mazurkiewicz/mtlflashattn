@@ -1,3 +1,6 @@
+<img width="1280" height="640" alt="image" src="https://github.com/user-attachments/assets/aa2ea73e-5fdb-41fc-86ca-7fde304aa04a" />
+
+
 # mtlflashattn
 
 **Memory-efficient, fast flash-attention for PyTorch on Apple Silicon (MPS)** — with a
