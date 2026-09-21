@@ -560,10 +560,12 @@ kernel void flash_attn_fwd_v2r(
     }
 }
 
-// probe: can the (single-simdgroup, half) QK destination feed PV as left input?
+// probe: can a half QK destination feed PV as left input, and does it share the
+// fp32 destination's per-lane layout (the kernel copies P across by index)?
 kernel void v2r_compat(
     device half* DUMMY [[buffer(0)]],
-    device int*  OUT   [[buffer(1)]])
+    device int*  OUT   [[buffer(1)]],
+    uint lane [[thread_index_in_simdgroup]])
 {
     constexpr auto qk_desc = matmul2d_descriptor(
         SR, BC, static_cast<int>(dynamic_extent), false, true, false,
@@ -576,8 +578,21 @@ kernel void v2r_compat(
 
     auto t = tensor(DUMMY, dextents<int,2>{DD, SR}, array<int,2>{1, DD});
     using TT = __tensor_ops_detail::__remove_addrspace_t<decltype(t)>;
-    auto ctS = qk_op.get_destination_cooperative_tensor<TT, TT, half>();
-    OUT[0] = pv_op.is_compatible_as_left_input<half, half, float>(ctS) ? 1 : 0;
+    auto ctP = qk_op.get_destination_cooperative_tensor<TT, TT, half>();
+    auto ctS = qk_op.get_destination_cooperative_tensor<TT, TT, float>();
+    bool same = ctS.get_capacity() == ctP.get_capacity();
+    if (same) {
+        for (uint16_t i = 0; i < ctS.get_capacity(); ++i) {
+            if (ctS.is_valid_element(i) != ctP.is_valid_element(i)) { same = false; break; }
+            if (!ctS.is_valid_element(i)) continue;
+            auto a = ctS.get_multidimensional_index(i);
+            auto b = ctP.get_multidimensional_index(i);
+            if (a[0] != b[0] || a[1] != b[1]) { same = false; break; }
+        }
+    }
+    same = simd_all(same);
+    if (lane == 0)
+        OUT[0] = (same && pv_op.is_compatible_as_left_input<half, half, float>(ctP)) ? 1 : 0;
 }
 """
 
@@ -777,7 +792,28 @@ def _v2r_dtype_ok(D, Lk, mode):
         return False
     if env not in ("1", "on", "true") and D > 64:
         return False
-    return _v2r_compat_probe(D)
+    return _v2r_dtype_compat_probe(D, mode)
+
+
+_v2r_dtype_compat = {}
+
+
+def _v2r_dtype_compat_probe(D, mode):
+    """_v2r_compat_probe for the dtype kernel's own element type."""
+    ok = _v2r_dtype_compat.get((D, mode))
+    if ok is None:
+        try:
+            dtype, et, _ = _v2_dtype_spec(mode)
+            lib = _get_v2r_dtype_lib(D, et)
+            dummy = torch.zeros(32 * D, dtype=dtype, device="mps")
+            out = torch.zeros(1, dtype=torch.int32, device="mps")
+            lib.v2r_dtype_compat(dummy, out, threads=(32, 1, 1), group_size=(32, 1, 1))
+            torch.mps.synchronize()
+            ok = bool(out.item())
+        except Exception:
+            ok = False
+        _v2r_dtype_compat[(D, mode)] = ok
+    return ok
 
 
 def _v2r_sr(D):
@@ -1315,10 +1351,7 @@ def _flash_v2_dtype(q, k, v, scale, causal, bias, mode):
     """Experimental TensorOps v2 dtype specialization. No auto promotion yet."""
     B, Hq, Lq, D = q.shape
     Hkv, Lk = k.shape[1], k.shape[2]
-    # Register-resident P (v2r) beats the threadgroup round-trip: bf16 ~2.5x at
-    # D<=64 and ~1.23x at D=128; fp32 ~1.45x at D<=64 (bit-exact) but loses at
-    # D=128. _v2r_dtype_ok encodes the per-dtype D ceiling (bf16: all eligible D,
-    # fp32: D<=64).
+    # _v2r_dtype_ok gates the register-resident path (D<=64, Lk>=256).
     if mode in ("v2_bf16", "v2_fp32") and _v2r_dtype_ok(D, Lk, mode):
         return _flash_v2r_dtype(q, k, v, scale, causal, bias, _v2_dtype_spec(mode)[1])
     qc = q.contiguous()
