@@ -115,22 +115,19 @@ def test_fp32_small_d_uses_register_resident_v2r(monkeypatch, causal):
     torch.testing.assert_close(out, ref, atol=2e-5, rtol=1e-4)
 
 
-def test_bf16_large_d_also_uses_v2r(monkeypatch):
-    """bf16 at D=128 ALSO uses v2r: SR=16 beats the threadgroup round-trip 1.23x
-    (22.5 vs 18.3 TF/s at L=26k). Only fp32 loses at D=128 (register pressure)."""
+def test_bf16_large_d_uses_threadgroup_kernel(monkeypatch):
+    """bf16 at D=128 takes the threadgroup round-trip: with fp32 S the
+    register-resident kernel loses there (11.5 vs 17.8 TF/s)."""
     from metal_flash_attn import _kernel
 
     require_v2()
     monkeypatch.setenv("MTLFLASHATTN_KERNEL", "v2_bf16")
+    monkeypatch.delenv("MTLFLASHATTN_V2_PREUSE", raising=False)
 
-    called = []
-    orig = _kernel._flash_v2r_dtype
+    def fail(*a, **kw):
+        raise AssertionError("bf16 D=128 must not use v2r")
 
-    def spy(*a, **kw):
-        called.append(True)
-        return orig(*a, **kw)
-
-    monkeypatch.setattr(_kernel, "_flash_v2r_dtype", spy)
+    monkeypatch.setattr(_kernel, "_flash_v2r_dtype", fail)
 
     g = torch.Generator(device="cpu").manual_seed(53)
     q = torch.randn(1, 4, 320, 128, generator=g).to("mps", torch.bfloat16)
@@ -140,15 +137,13 @@ def test_bf16_large_d_also_uses_v2r(monkeypatch):
 
     out = _kernel.flash_attn_forward(q, k, v, scale=scale, causal=False)
     ref = ref_attention(q, k, v, scale=scale, causal=False)
-    assert called, "bf16 D=128 did not use the register-resident v2r kernel"
     assert out.dtype == torch.bfloat16
     torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)
 
 
 def test_v2r_skipped_for_tiny_kv_length(monkeypatch):
-    """Below Lk=256 v2r is both slower AND less precise (bf16 softmax reduction
-    over few keys), so cross-attention with a tiny KV (e.g. image conditioning,
-    Lk=5) must stay on the threadgroup round-trip."""
+    """Below Lk=256 v2r is slower, so tiny-KV cross-attention (e.g. image
+    conditioning, Lk=5) must stay on the threadgroup round-trip."""
     from metal_flash_attn import _kernel
 
     require_v2()
@@ -238,3 +233,22 @@ def test_forced_v2_dtype_matches_runtime_dtype(monkeypatch, dtype, tol, seed, ca
         seed=seed,
         causal=causal,
     )
+
+
+@pytest.mark.parametrize("D", [64, 128])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_auto_tier_keeps_logits_full_precision(D, dtype):
+    """Peaked softmax must stay near output rounding: the auto tier may narrow P,
+    never the logits (bf16 S was ~1e-2 off here)."""
+    from metal_flash_attn import _kernel
+
+    require_v2()
+    g = torch.Generator(device="cpu").manual_seed(7)
+    q, k = ((torch.randn(1, 4, 1024, D, generator=g) * 2).to("mps", dtype) for _ in range(2))
+    v = torch.randn(1, 4, 1024, D, generator=g).to("mps", dtype)
+    scale = 1.0 / math.sqrt(D)
+
+    out = _kernel.flash_attn_forward(q, k, v, scale=scale, causal=False).float()
+    ref = ref_attention(q, k, v, scale=scale, causal=False)
+    rel = ((out - ref).norm() / ref.norm()).item()
+    assert rel < 5e-3, f"{_kernel._effective_kernel_label(q, k, v)}: relErr {rel:.2e}"

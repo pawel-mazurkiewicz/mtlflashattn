@@ -63,9 +63,9 @@ def test_trace_label_matches_dispatch_for_dtypes(monkeypatch):
     assert _kernel._effective_kernel_label(qf_long, qf_long, qf_long) == "v2r(float)"
     assert _kernel._effective_kernel_label(qf_short, qf_short, qf_short) == "torch"
 
-    # bf16 D=128 -> v2r too (1.23x over TG round-trip)
+    # bf16 D=128 -> threadgroup round-trip (fp32-S v2r loses on register pressure)
     qb128 = torch.randn(1, 2, 256, 128, device="mps", dtype=torch.bfloat16)
-    assert _kernel._effective_kernel_label(qb128, qb128, qb128) == "v2r(bfloat)"
+    assert _kernel._effective_kernel_label(qb128, qb128, qb128) == "v2_bf16(TG)"
 
     # fp32 D=128 -> threadgroup round-trip (v2r loses on fp32 register pressure)
     qf128 = torch.randn(1, 2, 4096, 128, device="mps", dtype=torch.float32)

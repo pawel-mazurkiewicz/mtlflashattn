@@ -456,22 +456,26 @@ kernel void flash_attn_fwd_v2r(
     auto mQ = tensor(Qp + q0*DD, dextents<int,2>{DD, min(SR, Lq - q0)}, array<int,2>{1, DD});
     using TT = __tensor_ops_detail::__remove_addrspace_t<decltype(mQ)>;
 
-    auto ctS = qk_op.get_destination_cooperative_tensor<TT, TT, half>();
+    // S stays fp32; only P is narrowed, into a same-layout tensor PV can take as left input.
+    auto ctS = qk_op.get_destination_cooperative_tensor<TT, TT, float>();
+    auto ctPd = qk_op.get_destination_cooperative_tensor<TT, TT, half>();
     using CtP = decltype(pv_op.get_left_input_cooperative_tensor<half, half, float>());
     auto ctO = pv_op.get_destination_cooperative_tensor<CtP, TT, float>();
     #pragma clang loop unroll(full)
     for (uint16_t i = 0; i < ctO.get_capacity(); ++i) ctO[i] = 0.0f;
+    #pragma clang loop unroll(full)
+    for (uint16_t i = 0; i < ctPd.get_capacity(); ++i) ctPd[i] = half(0.0f);
 
     const int shift = Lk - Lq;        // bottom-right causal alignment
     for (int j0 = 0; j0 < Lk; j0 += BC) {
         if (causal && j0 > q0 + SR - 1 + shift) break;
 
         #pragma clang loop unroll(full)
-        for (uint16_t i = 0; i < ctS.get_capacity(); ++i) ctS[i] = half(0.0h);
+        for (uint16_t i = 0; i < ctS.get_capacity(); ++i) ctS[i] = 0.0f;
         auto mK = tensor(Kp + j0*DD, dextents<int,2>{DD, BC}, array<int,2>{1, DD});
         qk_op.run(mQ, mK, ctS);
 
-        // scale + bounds/causal mask (half storage, fp32 math)
+        // scale + bounds/causal mask
         #pragma clang loop unroll(full)
         for (uint16_t i = 0; i < ctS.get_capacity(); ++i) {
             if (!ctS.is_valid_element(i)) continue;
@@ -480,15 +484,15 @@ kernel void flash_attn_fwd_v2r(
             const int ii = q0 + int(idx[1]);
             const bool ok = (jj < Lk) && (ii < Lq) && (!causal || jj <= ii + shift)
                 && (wl < 0 || jj >= ii + shift - wl) && (wr < 0 || jj <= ii + shift + wr);
-            float sv = float(ctS[i]) * scale;
+            float sv = ctS[i] * scale;
             if (softcap > 0.0f) sv = softcap * tanh(sv / softcap);
             if (do_alibi) sv -= AL[bh] * float(abs(ii + shift - jj));
-            ctS[i] = ok ? half(sv) : half(-INFINITY);
+            ctS[i] = ok ? sv : -INFINITY;
         }
 
         // block row-max via reduce_rows (legal at single-simdgroup scope)
-        auto ctMb = qk_op.get_row_reduction_destination_cooperative_tensor<TT, TT, half>();
-        reduce_rows(ctS, ctMb, reduction_operation::max, half(-INFINITY));
+        auto ctMb = qk_op.get_row_reduction_destination_cooperative_tensor<TT, TT, float>();
+        reduce_rows(ctS, ctMb, reduction_operation::max, -INFINITY);
         #pragma clang loop unroll(full)
         for (uint16_t i = 0; i < ctMb.get_capacity(); ++i) {
             if (!ctMb.is_valid_element(i)) continue;
@@ -504,18 +508,20 @@ kernel void flash_attn_fwd_v2r(
         }
         simdgroup_barrier(mem_flags::mem_threadgroup);
 
-        // P = exp(S - m) in place (half)
+        // P = exp(S - m): fp32 in ctS for the row sum, narrowed copy in ctPd for PV
         #pragma clang loop unroll(full)
         for (uint16_t i = 0; i < ctS.get_capacity(); ++i) {
             if (!ctS.is_valid_element(i)) continue;
             auto idx = ctS.get_multidimensional_index(i);
             const float mn = tgM[sgid][int(idx[1])];
-            ctS[i] = (mn == -INFINITY) ? half(0.0h) : half(exp(float(ctS[i]) - mn));
+            const float p = (mn == -INFINITY) ? 0.0f : exp(ctS[i] - mn);
+            ctS[i] = p;
+            ctPd[i] = half(p);
         }
 
         // block row-sum via reduce_rows, merge running l
-        auto ctLb = qk_op.get_row_reduction_destination_cooperative_tensor<TT, TT, half>();
-        reduce_rows(ctS, ctLb, reduction_operation::sum, half(0.0h));
+        auto ctLb = qk_op.get_row_reduction_destination_cooperative_tensor<TT, TT, float>();
+        reduce_rows(ctS, ctLb, reduction_operation::sum, 0.0f);
         #pragma clang loop unroll(full)
         for (uint16_t i = 0; i < ctLb.get_capacity(); ++i) {
             if (!ctLb.is_valid_element(i)) continue;
@@ -534,7 +540,7 @@ kernel void flash_attn_fwd_v2r(
             auto idx = ctO.get_multidimensional_index(i);
             ctO[i] *= tgCorr[sgid][int(idx[1])];
         }
-        auto ctP = pv_op.get_left_input_cooperative_tensor<half, half, float>(ctS);
+        auto ctP = pv_op.get_left_input_cooperative_tensor<half, half, float>(ctPd);
         auto mV = tensor(Vp + j0*DD, dextents<int,2>{DD, BC}, array<int,2>{1, DD});
         pv_op.run(ctP, mV, ctO);
     }
@@ -554,10 +560,12 @@ kernel void flash_attn_fwd_v2r(
     }
 }
 
-// probe: can the (single-simdgroup, half) QK destination feed PV as left input?
+// probe: can a half QK destination feed PV as left input, and does it share the
+// fp32 destination's per-lane layout (the kernel copies P across by index)?
 kernel void v2r_compat(
     device half* DUMMY [[buffer(0)]],
-    device int*  OUT   [[buffer(1)]])
+    device int*  OUT   [[buffer(1)]],
+    uint lane [[thread_index_in_simdgroup]])
 {
     constexpr auto qk_desc = matmul2d_descriptor(
         SR, BC, static_cast<int>(dynamic_extent), false, true, false,
@@ -570,8 +578,21 @@ kernel void v2r_compat(
 
     auto t = tensor(DUMMY, dextents<int,2>{DD, SR}, array<int,2>{1, DD});
     using TT = __tensor_ops_detail::__remove_addrspace_t<decltype(t)>;
-    auto ctS = qk_op.get_destination_cooperative_tensor<TT, TT, half>();
-    OUT[0] = pv_op.is_compatible_as_left_input<half, half, float>(ctS) ? 1 : 0;
+    auto ctP = qk_op.get_destination_cooperative_tensor<TT, TT, half>();
+    auto ctS = qk_op.get_destination_cooperative_tensor<TT, TT, float>();
+    bool same = ctS.get_capacity() == ctP.get_capacity();
+    if (same) {
+        for (uint16_t i = 0; i < ctS.get_capacity(); ++i) {
+            if (ctS.is_valid_element(i) != ctP.is_valid_element(i)) { same = false; break; }
+            if (!ctS.is_valid_element(i)) continue;
+            auto a = ctS.get_multidimensional_index(i);
+            auto b = ctP.get_multidimensional_index(i);
+            if (a[0] != b[0] || a[1] != b[1]) { same = false; break; }
+        }
+    }
+    same = simd_all(same);
+    if (lane == 0)
+        OUT[0] = (same && pv_op.is_compatible_as_left_input<half, half, float>(ctP)) ? 1 : 0;
 }
 """
 
@@ -726,8 +747,6 @@ def _v2_reuse_ok(D):
     Measured on M5 Max: v2r ~2x v2 at D=64 (25 vs 12 TF/s; causal 23 TF/s = 20x
     stock) but loses at D=128 (16.6 vs 18.5 TF/s — SR x 128 fp32 O registers per
     simdgroup collapse occupancy). auto => v2r only for D <= 64.
-    Tradeoff: v2r accumulates S in half (API forces source element type == left
-    input type), so its precision is v1-like rather than v2's fp32.
     MTLFLASHATTN_V2_PREUSE=1 forces it for all D, =0 disables.
     """
     mode = os.environ.get("MTLFLASHATTN_V2_PREUSE", "auto").lower()
@@ -760,15 +779,10 @@ _V2R_MIN_LK = 256  # below this, v2r is slower AND less precise than the TG kern
 
 
 def _v2r_dtype_ok(D, Lk, mode):
-    """Register-resident-P gate for the dtype kernels, by dtype, head dim, and
-    KV length. Measured M5 Max (v2r SR=16 vs the threadgroup-round-trip kernel):
-      bf16: 2.5x at D<=64, 1.23x at D=128 -> all eligible D.
-      fp32: 1.45x at D<=64, ~1.0x/loss at D=128 (fp32 S/O register pressure)
-            -> D<=64 only.
-    But v2r only amortizes past Lk~256 (it does the softmax reduction in the
-    element type, so few keys cost both speed and precision -- e.g. Lk=5 image-
-    conditioning cross-attention is 0.64x and 3x the error). Gate on Lk.
-    MTLFLASHATTN_V2_PREUSE=1 forces D ceiling (not the Lk floor), =0 disables."""
+    """Register-resident-P gate for the dtype kernels. v2r beats the threadgroup
+    kernel only at D<=64 (M5 Max: bf16 2.3x, fp32 1.45x); at D=128 its fp32 S
+    registers cost occupancy (bf16 11.5 vs 17.8 TF/s). It also needs Lk>=256 to
+    amortize. MTLFLASHATTN_V2_PREUSE=1 lifts the D ceiling (not the Lk floor)."""
     if D % 8 != 0 or D > MAX_HEAD_DIM:
         return False
     if Lk < _V2R_MIN_LK:
@@ -776,10 +790,30 @@ def _v2r_dtype_ok(D, Lk, mode):
     env = os.environ.get("MTLFLASHATTN_V2_PREUSE", "auto").lower()
     if env in ("0", "off", "false"):
         return False
-    ceiling = MAX_HEAD_DIM if mode == "v2_bf16" else 64
-    if env not in ("1", "on", "true") and D > ceiling:
+    if env not in ("1", "on", "true") and D > 64:
         return False
-    return _v2r_compat_probe(D)
+    return _v2r_dtype_compat_probe(D, mode)
+
+
+_v2r_dtype_compat = {}
+
+
+def _v2r_dtype_compat_probe(D, mode):
+    """_v2r_compat_probe for the dtype kernel's own element type."""
+    ok = _v2r_dtype_compat.get((D, mode))
+    if ok is None:
+        try:
+            dtype, et, _ = _v2_dtype_spec(mode)
+            lib = _get_v2r_dtype_lib(D, et)
+            dummy = torch.zeros(32 * D, dtype=dtype, device="mps")
+            out = torch.zeros(1, dtype=torch.int32, device="mps")
+            lib.v2r_dtype_compat(dummy, out, threads=(32, 1, 1), group_size=(32, 1, 1))
+            torch.mps.synchronize()
+            ok = bool(out.item())
+        except Exception:
+            ok = False
+        _v2r_dtype_compat[(D, mode)] = ok
+    return ok
 
 
 def _v2r_sr(D):
@@ -1317,10 +1351,7 @@ def _flash_v2_dtype(q, k, v, scale, causal, bias, mode):
     """Experimental TensorOps v2 dtype specialization. No auto promotion yet."""
     B, Hq, Lq, D = q.shape
     Hkv, Lk = k.shape[1], k.shape[2]
-    # Register-resident P (v2r) beats the threadgroup round-trip: bf16 ~2.5x at
-    # D<=64 and ~1.23x at D=128; fp32 ~1.45x at D<=64 (bit-exact) but loses at
-    # D=128. _v2r_dtype_ok encodes the per-dtype D ceiling (bf16: all eligible D,
-    # fp32: D<=64).
+    # _v2r_dtype_ok gates the register-resident path (D<=64, Lk>=256).
     if mode in ("v2_bf16", "v2_fp32") and _v2r_dtype_ok(D, Lk, mode):
         return _flash_v2r_dtype(q, k, v, scale, causal, bias, _v2_dtype_spec(mode)[1])
     qc = q.contiguous()
