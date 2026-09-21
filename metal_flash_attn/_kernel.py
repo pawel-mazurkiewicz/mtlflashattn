@@ -456,22 +456,26 @@ kernel void flash_attn_fwd_v2r(
     auto mQ = tensor(Qp + q0*DD, dextents<int,2>{DD, min(SR, Lq - q0)}, array<int,2>{1, DD});
     using TT = __tensor_ops_detail::__remove_addrspace_t<decltype(mQ)>;
 
-    auto ctS = qk_op.get_destination_cooperative_tensor<TT, TT, half>();
+    // S stays fp32; only P is narrowed, into a same-layout tensor PV can take as left input.
+    auto ctS = qk_op.get_destination_cooperative_tensor<TT, TT, float>();
+    auto ctPd = qk_op.get_destination_cooperative_tensor<TT, TT, half>();
     using CtP = decltype(pv_op.get_left_input_cooperative_tensor<half, half, float>());
     auto ctO = pv_op.get_destination_cooperative_tensor<CtP, TT, float>();
     #pragma clang loop unroll(full)
     for (uint16_t i = 0; i < ctO.get_capacity(); ++i) ctO[i] = 0.0f;
+    #pragma clang loop unroll(full)
+    for (uint16_t i = 0; i < ctPd.get_capacity(); ++i) ctPd[i] = half(0.0f);
 
     const int shift = Lk - Lq;        // bottom-right causal alignment
     for (int j0 = 0; j0 < Lk; j0 += BC) {
         if (causal && j0 > q0 + SR - 1 + shift) break;
 
         #pragma clang loop unroll(full)
-        for (uint16_t i = 0; i < ctS.get_capacity(); ++i) ctS[i] = half(0.0h);
+        for (uint16_t i = 0; i < ctS.get_capacity(); ++i) ctS[i] = 0.0f;
         auto mK = tensor(Kp + j0*DD, dextents<int,2>{DD, BC}, array<int,2>{1, DD});
         qk_op.run(mQ, mK, ctS);
 
-        // scale + bounds/causal mask (half storage, fp32 math)
+        // scale + bounds/causal mask
         #pragma clang loop unroll(full)
         for (uint16_t i = 0; i < ctS.get_capacity(); ++i) {
             if (!ctS.is_valid_element(i)) continue;
@@ -480,15 +484,15 @@ kernel void flash_attn_fwd_v2r(
             const int ii = q0 + int(idx[1]);
             const bool ok = (jj < Lk) && (ii < Lq) && (!causal || jj <= ii + shift)
                 && (wl < 0 || jj >= ii + shift - wl) && (wr < 0 || jj <= ii + shift + wr);
-            float sv = float(ctS[i]) * scale;
+            float sv = ctS[i] * scale;
             if (softcap > 0.0f) sv = softcap * tanh(sv / softcap);
             if (do_alibi) sv -= AL[bh] * float(abs(ii + shift - jj));
-            ctS[i] = ok ? half(sv) : half(-INFINITY);
+            ctS[i] = ok ? sv : -INFINITY;
         }
 
         // block row-max via reduce_rows (legal at single-simdgroup scope)
-        auto ctMb = qk_op.get_row_reduction_destination_cooperative_tensor<TT, TT, half>();
-        reduce_rows(ctS, ctMb, reduction_operation::max, half(-INFINITY));
+        auto ctMb = qk_op.get_row_reduction_destination_cooperative_tensor<TT, TT, float>();
+        reduce_rows(ctS, ctMb, reduction_operation::max, -INFINITY);
         #pragma clang loop unroll(full)
         for (uint16_t i = 0; i < ctMb.get_capacity(); ++i) {
             if (!ctMb.is_valid_element(i)) continue;
@@ -504,18 +508,20 @@ kernel void flash_attn_fwd_v2r(
         }
         simdgroup_barrier(mem_flags::mem_threadgroup);
 
-        // P = exp(S - m) in place (half)
+        // P = exp(S - m): fp32 in ctS for the row sum, narrowed copy in ctPd for PV
         #pragma clang loop unroll(full)
         for (uint16_t i = 0; i < ctS.get_capacity(); ++i) {
             if (!ctS.is_valid_element(i)) continue;
             auto idx = ctS.get_multidimensional_index(i);
             const float mn = tgM[sgid][int(idx[1])];
-            ctS[i] = (mn == -INFINITY) ? half(0.0h) : half(exp(float(ctS[i]) - mn));
+            const float p = (mn == -INFINITY) ? 0.0f : exp(ctS[i] - mn);
+            ctS[i] = p;
+            ctPd[i] = half(p);
         }
 
         // block row-sum via reduce_rows, merge running l
-        auto ctLb = qk_op.get_row_reduction_destination_cooperative_tensor<TT, TT, half>();
-        reduce_rows(ctS, ctLb, reduction_operation::sum, half(0.0h));
+        auto ctLb = qk_op.get_row_reduction_destination_cooperative_tensor<TT, TT, float>();
+        reduce_rows(ctS, ctLb, reduction_operation::sum, 0.0f);
         #pragma clang loop unroll(full)
         for (uint16_t i = 0; i < ctLb.get_capacity(); ++i) {
             if (!ctLb.is_valid_element(i)) continue;
@@ -534,7 +540,7 @@ kernel void flash_attn_fwd_v2r(
             auto idx = ctO.get_multidimensional_index(i);
             ctO[i] *= tgCorr[sgid][int(idx[1])];
         }
-        auto ctP = pv_op.get_left_input_cooperative_tensor<half, half, float>(ctS);
+        auto ctP = pv_op.get_left_input_cooperative_tensor<half, half, float>(ctPd);
         auto mV = tensor(Vp + j0*DD, dextents<int,2>{DD, BC}, array<int,2>{1, DD});
         pv_op.run(ctP, mV, ctO);
     }
@@ -726,8 +732,6 @@ def _v2_reuse_ok(D):
     Measured on M5 Max: v2r ~2x v2 at D=64 (25 vs 12 TF/s; causal 23 TF/s = 20x
     stock) but loses at D=128 (16.6 vs 18.5 TF/s — SR x 128 fp32 O registers per
     simdgroup collapse occupancy). auto => v2r only for D <= 64.
-    Tradeoff: v2r accumulates S in half (API forces source element type == left
-    input type), so its precision is v1-like rather than v2's fp32.
     MTLFLASHATTN_V2_PREUSE=1 forces it for all D, =0 disables.
     """
     mode = os.environ.get("MTLFLASHATTN_V2_PREUSE", "auto").lower()
@@ -760,15 +764,10 @@ _V2R_MIN_LK = 256  # below this, v2r is slower AND less precise than the TG kern
 
 
 def _v2r_dtype_ok(D, Lk, mode):
-    """Register-resident-P gate for the dtype kernels, by dtype, head dim, and
-    KV length. Measured M5 Max (v2r SR=16 vs the threadgroup-round-trip kernel):
-      bf16: 2.5x at D<=64, 1.23x at D=128 -> all eligible D.
-      fp32: 1.45x at D<=64, ~1.0x/loss at D=128 (fp32 S/O register pressure)
-            -> D<=64 only.
-    But v2r only amortizes past Lk~256 (it does the softmax reduction in the
-    element type, so few keys cost both speed and precision -- e.g. Lk=5 image-
-    conditioning cross-attention is 0.64x and 3x the error). Gate on Lk.
-    MTLFLASHATTN_V2_PREUSE=1 forces D ceiling (not the Lk floor), =0 disables."""
+    """Register-resident-P gate for the dtype kernels. v2r beats the threadgroup
+    kernel only at D<=64 (M5 Max: bf16 2.3x, fp32 1.45x); at D=128 its fp32 S
+    registers cost occupancy (bf16 11.5 vs 17.8 TF/s). It also needs Lk>=256 to
+    amortize. MTLFLASHATTN_V2_PREUSE=1 lifts the D ceiling (not the Lk floor)."""
     if D % 8 != 0 or D > MAX_HEAD_DIM:
         return False
     if Lk < _V2R_MIN_LK:
@@ -776,8 +775,7 @@ def _v2r_dtype_ok(D, Lk, mode):
     env = os.environ.get("MTLFLASHATTN_V2_PREUSE", "auto").lower()
     if env in ("0", "off", "false"):
         return False
-    ceiling = MAX_HEAD_DIM if mode == "v2_bf16" else 64
-    if env not in ("1", "on", "true") and D > ceiling:
+    if env not in ("1", "on", "true") and D > 64:
         return False
     return _v2r_compat_probe(D)
 

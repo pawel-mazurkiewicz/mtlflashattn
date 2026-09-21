@@ -103,7 +103,7 @@ Selected automatically by dtype, head dim, and sequence length (`MTLFLASHATTN_KE
 
 | Tier | Hardware | Notes |
 |---|---|---|
-| **v2r** | M5+ / macOS 27+ | TensorOps `matmul2d`, register-resident P (no threadgroup round-trip). Fastest. bf16 all D; fp32 D≤64; fp16 D≤64. Gated to Lk≥256. |
+| **v2r** | M5+ / macOS 27+ | TensorOps `matmul2d`, register-resident P (no threadgroup round-trip). Fastest. fp16/bf16/fp32 D≤64, Lk≥256. Logits and softmax stay fp32; only P is narrowed. |
 | **v2** | M5+ / macOS 26+ | TensorOps `matmul2d`, threadgroup-staged P. fp16/bf16/fp32 (`v2_fp32`/`v2_bf16`). |
 | **v1** | M1+ | `simdgroup_matrix` 8×8 FA-2. fp16 fallback when TensorOps is unavailable. |
 | **torch** | any MPS | Chunked fp32 matmul-softmax-matmul. The safe fp32 short-sequence path. |
@@ -127,8 +127,8 @@ faster**; effective TF/s in parens).
 
 | shape | bf16 | fp32 | precision |
 |---|---|---|---|
-| D=64 L=8k | **30.6** (2.5× over TG round-trip) | **12.5** (1.45×) | fp32 bit-exact; bf16 ~bf16 noise |
-| D=128 L=26k | **22.5** (1.23×) | 8.8 (TG) | bf16 ~bf16 noise |
+| D=64 L=8k | **30.6** (2.5× over TG round-trip) | **12.5** (1.45×) | fp32 bit-exact; bf16 at output rounding |
+| D=128 L=26k | 16.0 (TG; v2r loses here with fp32 S) | 8.8 (TG) | bf16 at output rounding |
 
 **Causal** adds block-skipping the MPS path lacks: fp16 D=64 L=8k v2r ≈ **23 TF/s (~20× stock)**.
 
@@ -142,7 +142,7 @@ Reproduce: `python bench/bench_attn.py` (fp16) and `python dev/bench_dtype_kerne
 
 ```
 [MTLFLASHATTN_TRACE] 4560 attention call(s), 6 distinct shape/kernel combos:
-  calls=990    bfloat16  D=128  Lq=26136 Lk=26136 causal=F  -> v2r(bfloat)
+  calls=990    bfloat16  D=128  Lq=26136 Lk=26136 causal=F  -> v2_bf16(TG)
   calls=990    bfloat16  D=128  Lq=26136 Lk=5     causal=F  -> v2_bf16(TG)
   ...
 ```
@@ -175,8 +175,8 @@ The full build log — the TensorOps/MPP API gotchas discovered empirically on m
 tensor destinations always accumulate; `reduce_rows` requires single-simdgroup scope and its
 row-reduction output is per-thread *co-located* with the source — the reduced value for row `r`
 sits on every lane that owns row `r`'s columns, with the reduction's row index at `idx[0]` vs the
-source's at `idx[1]`; the register-resident P recipe forces the S element type to match the left
-input), the per-tier design, and the speed/precision analysis are documented inline in the kernel
+source's at `idx[1]`; the register-resident P recipe needs a left-input source of the same element type, so S stays
+fp32 and P is narrowed into a second, same-layout destination tensor), the per-tier design, and the speed/precision analysis are documented inline in the kernel
 source (`metal_flash_attn/_kernel.py`).
 
 ## License
